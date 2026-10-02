@@ -2,30 +2,71 @@ import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { WebSocket, WebSocketServer } from 'ws'
 import { generateRoomId, isValidRoomId } from './ids.js'
-import { CLOSE_MALFORMED } from './protocol.js'
-import { RoomManager } from './room.js'
+import { CLOSE_LOAD_FAILED, CLOSE_MALFORMED } from './protocol.js'
+import { Room, RoomManager } from './room.js'
 import { serveStatic } from './static.js'
+import { MemoryStorage } from './storage/memory.js'
+import type { RoomStorage } from './storage/types.js'
 
 const WS_PATH_PREFIX = '/ws/'
 const HEARTBEAT_INTERVAL_MS = 30_000
+// Frames a client may send while its room is still loading from storage.
+const MAX_BACKLOG_FRAMES = 64
+const DAY_MS = 24 * 60 * 60 * 1000
+
+export interface PairPadServerOptions {
+  /** Directory holding the built frontend. Omit to run as an API-only server. */
+  staticDir?: string
+  /** Where rooms are saved. Defaults to memory only. The server closes it on shutdown. */
+  storage?: RoomStorage
+  /** How long edits are batched before being written. */
+  flushMs?: number
+  /** Stored rows per room before they are squashed into one snapshot. */
+  compactAfter?: number
+  /** How long to wait before retrying a failed write. */
+  retryMs?: number
+  /** How long an empty room stays in memory before it is saved and unloaded. */
+  idleUnloadMs?: number
+  /** Rooms unused for this long are deleted. */
+  roomTtlMs?: number
+  /** How often to look for rooms to delete. */
+  cleanupIntervalMs?: number
+  /** Clock, replaceable in tests. */
+  now?: () => number
+  onError?: (error: unknown, context: string) => void
+}
 
 export interface PairPadServer {
   readonly rooms: RoomManager
   /** Starts listening and resolves with the bound port (pass 0 for a random one). */
   listen(port: number, host?: string): Promise<number>
+  /** Deletes rooms unused for longer than the TTL and returns their IDs. Also runs on a timer. */
+  cleanup(): Promise<string[]>
+  /** Saves every room and stops the server. */
   close(): Promise<void>
 }
 
-export interface PairPadServerOptions {
-  /** Directory holding the built frontend. Omit to run as an API-only server. */
-  staticDir?: string
-}
-
 export function createPairPadServer(options: PairPadServerOptions = {}): PairPadServer {
-  const { staticDir } = options
-  const rooms = new RoomManager()
+  const {
+    staticDir,
+    storage = new MemoryStorage(),
+    roomTtlMs = 7 * DAY_MS,
+    cleanupIntervalMs = 60 * 60 * 1000,
+    onError = (error, context) => console.error(`Error ${context}:`, error),
+  } = options
+
+  const rooms = new RoomManager({
+    storage,
+    flushMs: options.flushMs ?? 300,
+    compactAfter: options.compactAfter ?? 100,
+    retryMs: options.retryMs ?? 2000,
+    idleUnloadMs: options.idleUnloadMs ?? 30_000,
+    now: options.now ?? Date.now,
+    onError,
+  })
   const wss = new WebSocketServer({ noServer: true })
   const alive = new WeakMap<WebSocket, boolean>()
+  let cleanupTimer: NodeJS.Timeout | null = null
 
   const httpServer = http.createServer((req, res) => {
     handleRequest(req, res).catch(() => {
@@ -70,8 +111,19 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
   })
 
   function onConnection(conn: WebSocket, roomId: string): void {
-    const room = rooms.getOrCreate(roomId)
     alive.set(conn, true)
+    // The socket is open before the room has loaded from storage, so frames
+    // that arrive in the meantime wait here and are replayed in order.
+    let room: Room | null = null
+    const backlog: Uint8Array[] = []
+
+    const handle = (target: Room, data: Uint8Array): void => {
+      try {
+        target.handleMessage(conn, data)
+      } catch {
+        conn.close(CLOSE_MALFORMED, 'malformed message')
+      }
+    }
 
     conn.on('pong', () => alive.set(conn, true))
     conn.on('message', (data, isBinary) => {
@@ -79,16 +131,40 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
         conn.close(CLOSE_MALFORMED, 'binary frames only')
         return
       }
-      try {
-        room.handleMessage(conn, toUint8Array(data as Buffer))
-      } catch {
-        conn.close(CLOSE_MALFORMED, 'malformed message')
+      const bytes = toUint8Array(data as Buffer)
+      if (room) {
+        handle(room, bytes)
+      } else if (backlog.length < MAX_BACKLOG_FRAMES) {
+        backlog.push(bytes)
+      } else {
+        conn.close(CLOSE_MALFORMED, 'too many messages before sync')
       }
     })
-    conn.on('close', () => room.removeConnection(conn))
+    conn.on('close', () => {
+      if (!room) return
+      room.removeConnection(conn)
+      rooms.release(room)
+    })
     conn.on('error', () => conn.terminate())
 
-    room.addConnection(conn)
+    rooms.acquire(roomId).then(
+      (loaded) => {
+        if (conn.readyState !== WebSocket.OPEN) {
+          // The client gave up while the room was loading.
+          rooms.release(loaded)
+          return
+        }
+        room = loaded
+        loaded.addConnection(conn)
+        for (const bytes of backlog) handle(loaded, bytes)
+        backlog.length = 0
+      },
+      (error) => {
+        onError(error, `loading room ${roomId}`)
+        // The client's provider retries with backoff, which suits a database blip.
+        conn.close(CLOSE_LOAD_FAILED, 'could not load room')
+      },
+    )
   }
 
   // Drop connections that stopped answering pings (e.g. laptop lid closed).
@@ -104,9 +180,23 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
   }, HEARTBEAT_INTERVAL_MS)
   heartbeat.unref()
 
+  async function cleanup(): Promise<string[]> {
+    try {
+      return await rooms.deleteInactive(roomTtlMs)
+    } catch (error) {
+      onError(error, 'deleting inactive rooms')
+      return []
+    }
+  }
+
   return {
     rooms,
-    listen(port, host) {
+    cleanup,
+    async listen(port, host) {
+      await storage.init()
+      void cleanup()
+      cleanupTimer = setInterval(() => void cleanup(), cleanupIntervalMs)
+      cleanupTimer.unref()
       return new Promise((resolve, reject) => {
         httpServer.once('error', reject)
         httpServer.listen(port, host, () => {
@@ -115,18 +205,18 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
         })
       })
     },
-    close() {
+    async close() {
       clearInterval(heartbeat)
+      if (cleanupTimer) clearInterval(cleanupTimer)
       for (const conn of wss.clients) conn.terminate()
       wss.close()
-      return new Promise((resolve, reject) => {
-        httpServer.close((err) => {
-          rooms.destroyAll()
-          if (err) reject(err)
-          else resolve()
-        })
+      await new Promise<void>((resolve) => {
+        httpServer.close(() => resolve())
         httpServer.closeAllConnections()
       })
+      // Every room gets its final save before the database connection closes.
+      await rooms.closeAll()
+      await storage.close()
     },
   }
 }

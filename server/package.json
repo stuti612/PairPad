@@ -13,12 +13,16 @@
   },
   "dependencies": {
     "lib0": "^0.2.99",
+    "pg": "^8.23.1",
     "ws": "^8.18.0",
     "y-protocols": "^1.0.6",
     "yjs": "^13.6.20"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@electric-sql/pglite-socket": "^0.2.11",
     "@types/node": "^22.7.0",
+    "@types/pg": "^8.23.1",
     "@types/ws": "^8.5.12",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",

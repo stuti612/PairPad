@@ -4,7 +4,9 @@ import * as awarenessProtocol from 'y-protocols/awareness'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
 import { WebSocket } from 'ws'
+import { RoomPersistence, type PersistenceOptions } from './persistence.js'
 import { MSG_AWARENESS, MSG_QUERY_AWARENESS, MSG_SYNC } from './protocol.js'
+import type { RoomStorage } from './storage/types.js'
 
 interface AwarenessChange {
   added: number[]
@@ -158,34 +160,137 @@ export class Room {
   }
 }
 
+interface Entry {
+  room: Room
+  persistence: RoomPersistence
+  idleTimer: NodeJS.Timeout | null
+}
+
+export interface RoomManagerOptions extends PersistenceOptions {
+  storage: RoomStorage
+  /** How long an empty room stays in memory before it is saved and unloaded. */
+  idleUnloadMs: number
+}
+
+/**
+ * Owns the rooms that are currently in memory: loads them from storage on
+ * first use, saves them as they change, and unloads them once empty.
+ */
 export class RoomManager {
-  private readonly rooms = new Map<string, Room>()
+  private readonly entries = new Map<string, Entry>()
+  private readonly loading = new Map<string, Promise<Room>>()
+  private readonly unloading = new Map<string, Promise<void>>()
+
+  constructor(private readonly options: RoomManagerOptions) {}
 
   get(id: string): Room | undefined {
-    return this.rooms.get(id)
+    return this.entries.get(id)?.room
   }
 
-  getOrCreate(id: string): Room {
-    let room = this.rooms.get(id)
-    if (!room) {
-      room = new Room(id)
-      this.rooms.set(id, room)
+  /**
+   * Returns the room, loading it from storage if needed. The caller must
+   * follow up with either room.addConnection() or release().
+   */
+  acquire(id: string): Promise<Room> {
+    const entry = this.entries.get(id)
+    if (entry) {
+      this.cancelIdle(entry)
+      return Promise.resolve(entry.room)
     }
-    return room
+    // Everyone who arrives while the room is loading shares the same load.
+    let loading = this.loading.get(id)
+    if (!loading) {
+      loading = this.load(id).finally(() => this.loading.delete(id))
+      this.loading.set(id, loading)
+    }
+    return loading
+  }
+
+  /** Call after a connection leaves; an empty room is unloaded after a grace period. */
+  release(room: Room): void {
+    const entry = this.entries.get(room.id)
+    if (!entry || entry.room !== room || room.size > 0 || entry.idleTimer) return
+    entry.idleTimer = setTimeout(() => {
+      entry.idleTimer = null
+      if (room.size === 0) void this.unload(room.id)
+    }, this.options.idleUnloadMs)
+    entry.idleTimer.unref()
+  }
+
+  /** Writes any buffered edits for every room in memory. */
+  async flushAll(): Promise<void> {
+    await Promise.all([...this.entries.values()].map((entry) => entry.persistence.flush()))
+  }
+
+  /** Deletes rooms nobody has used for `ttlMs`. Rooms with people in them always survive. */
+  async deleteInactive(ttlMs: number): Promise<string[]> {
+    const now = this.options.now()
+    await Promise.all(
+      [...this.entries.values()]
+        .filter((entry) => entry.room.size > 0)
+        .map((entry) => this.options.storage.touch(entry.room.id, now)),
+    )
+    return this.options.storage.deleteInactive(now - ttlMs)
   }
 
   get roomCount(): number {
-    return this.rooms.size
+    return this.entries.size
   }
 
   get clientCount(): number {
     let total = 0
-    for (const room of this.rooms.values()) total += room.size
+    for (const { room } of this.entries.values()) total += room.size
     return total
   }
 
-  destroyAll(): void {
-    for (const room of this.rooms.values()) room.destroy()
-    this.rooms.clear()
+  /** Saves and unloads everything, for shutdown. */
+  async closeAll(): Promise<void> {
+    await Promise.allSettled(this.loading.values())
+    for (const id of [...this.entries.keys()]) void this.unload(id)
+    await Promise.all(this.unloading.values())
+  }
+
+  private async load(id: string): Promise<Room> {
+    // If this room is mid-way through its final save, wait so we read all of it.
+    await this.unloading.get(id)
+    const { storage, now, onError } = this.options
+    const updates = await storage.load(id)
+
+    const room = new Room(id)
+    for (const update of updates) {
+      try {
+        Y.applyUpdate(room.doc, update, 'storage')
+      } catch (error) {
+        // One unreadable row should not make the whole room unopenable.
+        onError(error, `reading a stored update for room ${id}`)
+      }
+    }
+    // Attached after loading so stored updates are not written back again.
+    const persistence = new RoomPersistence(id, room.doc, storage, updates.length, this.options)
+    this.entries.set(id, { room, persistence, idleTimer: null })
+    if (updates.length > 0) {
+      storage.touch(id, now()).catch((error) => onError(error, `touching room ${id}`))
+    }
+    return room
+  }
+
+  private unload(id: string): Promise<void> {
+    const entry = this.entries.get(id)
+    if (!entry) return this.unloading.get(id) ?? Promise.resolve()
+    this.cancelIdle(entry)
+    this.entries.delete(id)
+    const done = entry.persistence
+      .close()
+      .then(() => entry.room.destroy())
+      .finally(() => {
+        if (this.unloading.get(id) === done) this.unloading.delete(id)
+      })
+    this.unloading.set(id, done)
+    return done
+  }
+
+  private cancelIdle(entry: Entry): void {
+    if (entry.idleTimer) clearTimeout(entry.idleTimer)
+    entry.idleTimer = null
   }
 }

@@ -31,13 +31,18 @@ export async function startTestServer(options: PairPadServerOptions = {}): Promi
 
 /** A minimal Yjs client speaking the same wire protocol as the browser. */
 export class TestClient {
-  readonly doc = new Y.Doc()
-  readonly awareness = new awarenessProtocol.Awareness(this.doc)
+  readonly awareness: awarenessProtocol.Awareness
   readonly ws: WebSocket
   synced = false
   closeCode: number | null = null
 
-  constructor(wsUrl: string, roomId: string) {
+  /** Pass an existing doc to simulate a client reconnecting with its local copy. */
+  constructor(
+    wsUrl: string,
+    roomId: string,
+    readonly doc: Y.Doc = new Y.Doc(),
+  ) {
+    this.awareness = new awarenessProtocol.Awareness(doc)
     this.ws = new WebSocket(`${wsUrl}/${roomId}`)
     this.ws.binaryType = 'nodebuffer'
 

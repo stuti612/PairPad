@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { createPairPadServer } from './server.js'
+import { storageFromEnv } from './storage/index.js'
 
 const port = Number(process.env.PORT ?? 3001)
 const host = process.env.HOST ?? '0.0.0.0'
@@ -10,15 +11,24 @@ const defaultStaticDir = path.resolve(import.meta.dirname, '../../client/dist')
 const staticDir = process.env.STATIC_DIR ?? defaultStaticDir
 const hasFrontend = existsSync(path.join(staticDir, 'index.html'))
 
-const server = createPairPadServer({ staticDir: hasFrontend ? staticDir : undefined })
+const { storage, description } = await storageFromEnv()
+const server = createPairPadServer({ staticDir: hasFrontend ? staticDir : undefined, storage })
 const boundPort = await server.listen(port, host)
 console.log(`PairPad server listening on http://${host}:${boundPort}`)
+console.log(`Storage: ${description}`)
 if (!hasFrontend) {
   console.log(`No built frontend at ${staticDir}; serving the API and WebSocket only.`)
 }
 
+// Save every room before exiting, so a deploy or restart loses nothing.
+let stopping = false
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-  process.once(signal, () => {
-    server.close().finally(() => process.exit(0))
+  process.on(signal, () => {
+    if (stopping) process.exit(1)
+    stopping = true
+    server
+      .close()
+      .catch((error) => console.error('Error during shutdown:', error))
+      .finally(() => process.exit(0))
   })
 }

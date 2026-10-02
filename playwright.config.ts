@@ -16,7 +16,8 @@ export default defineConfig({
   webServer: {
     command: 'npm run build && npm run start',
     url: `http://127.0.0.1:${PORT}/health`,
-    env: { PORT: String(PORT), HOST: '127.0.0.1' },
+    // A throwaway database, so test pads never land in the dev database.
+    env: { PORT: String(PORT), HOST: '127.0.0.1', SQLITE_PATH: ':memory:' },
     reuseExistingServer: false,
     timeout: 120_000,
   },
