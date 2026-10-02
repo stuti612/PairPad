@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local database files
+data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Test output
+test-results/
+playwright-report/
+coverage/
+
+# Misc
+*.log
+.DS_Store
