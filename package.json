@@ -15,10 +15,14 @@
     "start": "npm run start -w server",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm test --workspaces --if-present",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "loadtest": "npm run loadtest -w server --"
   },
   "devDependencies": {
     "@playwright/test": "^1.48.0",
     "concurrently": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=22.5"
   }
 }
