@@ -3,6 +3,7 @@ import { WebsocketProvider } from 'y-websocket'
 import * as Y from 'yjs'
 import { DEFAULT_LANGUAGE, isLanguageId, type LanguageId } from './languages'
 import { websocketBaseUrl } from './rooms'
+import { isPermanentClose } from './useConnection'
 
 // Shared type names inside the Y.Doc. TEXT_KEY must match server/src/protocol.ts.
 const TEXT_KEY = 'content'
@@ -22,7 +23,11 @@ export function usePad(roomId: string): PadSession | null {
 
   useEffect(() => {
     const doc = new Y.Doc()
-    const provider = new WebsocketProvider(websocketBaseUrl(), roomId, doc)
+    // The provider reconnects by itself with backoff (at most 2.5 s apart)
+    // and re-syncs both ways, which is what merges edits made while offline.
+    const provider = new WebsocketProvider(websocketBaseUrl(), roomId, doc, {
+      shouldReconnect: (event) => !isPermanentClose(event.code),
+    })
     setSession({ doc, provider, text: doc.getText(TEXT_KEY), meta: doc.getMap(META_KEY) })
     return () => {
       provider.destroy()

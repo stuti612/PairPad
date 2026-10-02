@@ -2,8 +2,14 @@ import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { WebSocket, WebSocketServer } from 'ws'
 import { generateRoomId, isValidRoomId } from './ids.js'
-import { CLOSE_LOAD_FAILED, CLOSE_MALFORMED } from './protocol.js'
-import { Room, RoomManager } from './room.js'
+import { Metrics } from './metrics.js'
+import {
+  CLOSE_LOAD_FAILED,
+  CLOSE_MALFORMED,
+  CLOSE_ROOM_FULL,
+  CLOSE_TOO_LARGE,
+} from './protocol.js'
+import { DocTooLargeError, Room, RoomManager } from './room.js'
 import { serveStatic } from './static.js'
 import { MemoryStorage } from './storage/memory.js'
 import type { RoomStorage } from './storage/types.js'
@@ -13,6 +19,11 @@ const HEARTBEAT_INTERVAL_MS = 30_000
 // Frames a client may send while its room is still loading from storage.
 const MAX_BACKLOG_FRAMES = 64
 const DAY_MS = 24 * 60 * 60 * 1000
+// Room for the sync framing around a document that is itself at the limit.
+const FRAME_OVERHEAD_BYTES = 64 * 1024
+
+export const DEFAULT_MAX_USERS_PER_ROOM = 10
+export const DEFAULT_MAX_DOC_BYTES = 1024 * 1024
 
 export interface PairPadServerOptions {
   /** Directory holding the built frontend. Omit to run as an API-only server. */
@@ -27,6 +38,10 @@ export interface PairPadServerOptions {
   retryMs?: number
   /** How long an empty room stays in memory before it is saved and unloaded. */
   idleUnloadMs?: number
+  /** People allowed in one room at a time. */
+  maxUsersPerRoom?: number
+  /** Largest allowed document, measured as its encoded Yjs state in bytes. */
+  maxDocBytes?: number
   /** Rooms unused for this long are deleted. */
   roomTtlMs?: number
   /** How often to look for rooms to delete. */
@@ -53,7 +68,11 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
     roomTtlMs = 7 * DAY_MS,
     cleanupIntervalMs = 60 * 60 * 1000,
     onError = (error, context) => console.error(`Error ${context}:`, error),
+    maxUsersPerRoom = DEFAULT_MAX_USERS_PER_ROOM,
+    maxDocBytes = DEFAULT_MAX_DOC_BYTES,
+    now = Date.now,
   } = options
+  const metrics = new Metrics(now)
 
   const rooms = new RoomManager({
     storage,
@@ -61,10 +80,15 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
     compactAfter: options.compactAfter ?? 100,
     retryMs: options.retryMs ?? 2000,
     idleUnloadMs: options.idleUnloadMs ?? 30_000,
-    now: options.now ?? Date.now,
+    maxDocBytes,
+    now,
     onError,
   })
-  const wss = new WebSocketServer({ noServer: true })
+  // ws itself refuses any single frame bigger than a full document could need.
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: maxDocBytes + FRAME_OVERHEAD_BYTES,
+  })
   const alive = new WeakMap<WebSocket, boolean>()
   let cleanupTimer: NodeJS.Timeout | null = null
 
@@ -85,11 +109,18 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
       // Rooms are created lazily on first connect; this only hands out an ID.
       return sendJson(res, 201, { id: generateRoomId() })
     }
-    if (req.method === 'GET' && pathname === '/health') {
-      return sendJson(res, 200, {
-        status: 'ok',
+    if (req.method === 'GET' && (pathname === '/health' || pathname === '/metrics')) {
+      const snapshot = {
         rooms: rooms.roomCount,
         clients: rooms.clientCount,
+        messagesPerSecond: metrics.messagesPerSecond(),
+      }
+      if (pathname === '/health') return sendJson(res, 200, { status: 'ok', ...snapshot })
+      return sendJson(res, 200, {
+        ...snapshot,
+        messagesTotal: metrics.messagesTotal,
+        uptimeSeconds: metrics.uptimeSeconds(),
+        limits: { maxUsersPerRoom, maxDocBytes },
       })
     }
     const isPage = req.method === 'GET' || req.method === 'HEAD'
@@ -120,13 +151,15 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
     const handle = (target: Room, data: Uint8Array): void => {
       try {
         target.handleMessage(conn, data)
-      } catch {
-        conn.close(CLOSE_MALFORMED, 'malformed message')
+      } catch (error) {
+        if (error instanceof DocTooLargeError) conn.close(CLOSE_TOO_LARGE, 'document too large')
+        else conn.close(CLOSE_MALFORMED, 'malformed message')
       }
     }
 
     conn.on('pong', () => alive.set(conn, true))
     conn.on('message', (data, isBinary) => {
+      metrics.recordMessage()
       if (!isBinary) {
         conn.close(CLOSE_MALFORMED, 'binary frames only')
         return
@@ -145,12 +178,21 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
       room.removeConnection(conn)
       rooms.release(room)
     })
-    conn.on('error', () => conn.terminate())
+    // ws has already started a proper close (e.g. 1009 for an oversized
+    // frame) by the time it reports an error; only force it if it has not.
+    conn.on('error', () => {
+      if (conn.readyState === WebSocket.OPEN) conn.terminate()
+    })
 
     rooms.acquire(roomId).then(
       (loaded) => {
         if (conn.readyState !== WebSocket.OPEN) {
           // The client gave up while the room was loading.
+          rooms.release(loaded)
+          return
+        }
+        if (loaded.size >= maxUsersPerRoom) {
+          conn.close(CLOSE_ROOM_FULL, 'room full')
           rooms.release(loaded)
           return
         }

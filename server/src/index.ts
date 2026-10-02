@@ -12,12 +12,22 @@ const staticDir = process.env.STATIC_DIR ?? defaultStaticDir
 const hasFrontend = existsSync(path.join(staticDir, 'index.html'))
 
 const { storage, description } = await storageFromEnv()
-const server = createPairPadServer({ staticDir: hasFrontend ? staticDir : undefined, storage })
+const server = createPairPadServer({
+  staticDir: hasFrontend ? staticDir : undefined,
+  storage,
+  maxUsersPerRoom: positiveInt(process.env.MAX_USERS_PER_ROOM),
+  maxDocBytes: positiveInt(process.env.MAX_DOC_BYTES),
+})
 const boundPort = await server.listen(port, host)
 console.log(`PairPad server listening on http://${host}:${boundPort}`)
 console.log(`Storage: ${description}`)
 if (!hasFrontend) {
   console.log(`No built frontend at ${staticDir}; serving the API and WebSocket only.`)
+}
+
+function positiveInt(value: string | undefined): number | undefined {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
 }
 
 // Save every room before exiting, so a deploy or restart loses nothing.

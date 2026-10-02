@@ -63,7 +63,7 @@ describe('room creation', () => {
     await connect('room0002')
     const res = await fetch(`${ts.httpUrl}/health`)
     expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ status: 'ok', rooms: 2, clients: 3 })
+    expect(await res.json()).toMatchObject({ status: 'ok', rooms: 2, clients: 3 })
   })
 })
 

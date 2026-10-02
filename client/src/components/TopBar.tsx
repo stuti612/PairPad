@@ -1,17 +1,31 @@
 import { useEffect, useRef, useState } from 'react'
 import { LANGUAGES, type LanguageId } from '../lib/languages'
+import type { ConnectionStatus } from '../lib/useConnection'
 import type { Presence } from '../lib/usePresence'
 import { onLinkClick } from '../router'
 import { PresenceMenu } from './PresenceMenu'
+import { StatusBadge } from './StatusBadge'
 
 interface TopBarProps {
   roomId: string
   language: LanguageId
   onLanguageChange: (language: LanguageId) => void
   presence: Presence
+  status: ConnectionStatus
+  unsynced: boolean
+  /** The server refused this session for good; the badge would only mislead. */
+  stopped: boolean
 }
 
-export function TopBar({ roomId, language, onLanguageChange, presence }: TopBarProps) {
+export function TopBar({
+  roomId,
+  language,
+  onLanguageChange,
+  presence,
+  status,
+  unsynced,
+  stopped,
+}: TopBarProps) {
   return (
     <header className="topbar">
       <a className="brand" href="/" onClick={onLinkClick}>
@@ -22,6 +36,7 @@ export function TopBar({ roomId, language, onLanguageChange, presence }: TopBarP
       </span>
       <CopyLinkButton />
       <div className="topbar-spacer" />
+      {!stopped && <StatusBadge status={status} unsynced={unsynced} />}
       <PresenceMenu {...presence} />
       <label className="language-picker">
         <span className="visually-hidden">Language</span>

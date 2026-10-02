@@ -14,6 +14,16 @@ interface AwarenessChange {
   removed: number[]
 }
 
+/** Thrown when an update would take a document past the size limit. */
+export class DocTooLargeError extends Error {
+  constructor() {
+    super('document size limit reached')
+  }
+}
+
+// Presence is a name, a color and a cursor; anything much bigger is abuse.
+const MAX_AWARENESS_BYTES = 16 * 1024
+
 /**
  * One pad: the authoritative Y.Doc, its awareness (presence) state, and the
  * sockets currently attached to it.
@@ -24,8 +34,15 @@ export class Room {
   // Each connection maps to the awareness client IDs it announced, so their
   // presence can be cleared when the socket goes away.
   private readonly conns = new Map<WebSocket, Set<number>>()
+  // Upper estimate of the encoded document size, so the exact (and slower)
+  // measurement only happens when a room is actually close to the limit.
+  private sizeEstimate = 0
 
-  constructor(readonly id: string) {
+  constructor(
+    readonly id: string,
+    /** Largest allowed encoded document, in bytes. */
+    private readonly maxDocBytes: number = Infinity,
+  ) {
     // The server is not a participant, so it has no presence of its own.
     this.awareness.setLocalState(null)
     this.doc.on('update', this.onDocUpdate)
@@ -55,7 +72,16 @@ export class Room {
     awarenessProtocol.removeAwarenessStates(this.awareness, [...clientIds], null)
   }
 
-  /** Applies one client frame. Throws if the frame is malformed. */
+  /** Applies an update read from storage. Stored data is never refused for size. */
+  applyStored(update: Uint8Array): void {
+    Y.applyUpdate(this.doc, update, 'storage')
+    this.sizeEstimate += update.byteLength
+  }
+
+  /**
+   * Applies one client frame. Throws DocTooLargeError if it would take the
+   * document past the size limit, or another error if the frame is malformed.
+   */
   handleMessage(conn: WebSocket, data: Uint8Array): void {
     const decoder = decoding.createDecoder(data)
     const type = decoding.readVarUint(decoder)
@@ -63,13 +89,12 @@ export class Room {
       case MSG_SYNC:
         this.handleSync(conn, decoder)
         break
-      case MSG_AWARENESS:
-        awarenessProtocol.applyAwarenessUpdate(
-          this.awareness,
-          decoding.readVarUint8Array(decoder),
-          conn,
-        )
+      case MSG_AWARENESS: {
+        const update = decoding.readVarUint8Array(decoder)
+        if (update.byteLength > MAX_AWARENESS_BYTES) throw new Error('presence update too large')
+        awarenessProtocol.applyAwarenessUpdate(this.awareness, update, conn)
         break
+      }
       case MSG_QUERY_AWARENESS:
         this.sendAwarenessStates(conn)
         break
@@ -99,15 +124,51 @@ export class Room {
         break
       }
       case syncProtocol.messageYjsSyncStep2:
-      case syncProtocol.messageYjsUpdate:
-        Y.applyUpdate(this.doc, decoding.readVarUint8Array(decoder), conn)
+      case syncProtocol.messageYjsUpdate: {
+        const update = decoding.readVarUint8Array(decoder)
+        this.assertFits(update)
+        Y.applyUpdate(this.doc, update, conn)
         break
+      }
       default:
         throw new Error(`unknown sync message type ${syncType}`)
     }
   }
 
-  private onDocUpdate =(update: Uint8Array, origin: unknown): void => {
+  /**
+   * The limit is on the encoded document: the text plus the CRDT's own
+   * bookkeeping, which is what gets stored and sent to everyone who joins.
+   * A Yjs update cannot be undone once applied, so the check comes first.
+   */
+  private assertFits(update: Uint8Array): void {
+    // Applying an update grows the document by at most about its own size.
+    if (this.sizeEstimate + update.byteLength <= this.maxDocBytes) {
+      this.sizeEstimate += update.byteLength
+      return
+    }
+    // The estimate only ever overshoots (it ignores deletions), so measure.
+    const state = Y.encodeStateAsUpdate(this.doc)
+    this.sizeEstimate = state.byteLength
+    if (state.byteLength + update.byteLength <= this.maxDocBytes) {
+      this.sizeEstimate += update.byteLength
+      return
+    }
+    // Genuinely close to the limit: try the update on a copy. Updates that
+    // shrink the document (deleting text) are always allowed, so a full pad
+    // can be brought back under the limit.
+    const trial = new Y.Doc()
+    try {
+      Y.applyUpdate(trial, state)
+      Y.applyUpdate(trial, update)
+      const after = Y.encodeStateAsUpdate(trial).byteLength
+      if (after > this.maxDocBytes && after > state.byteLength) throw new DocTooLargeError()
+      this.sizeEstimate = after
+    } finally {
+      trial.destroy()
+    }
+  }
+
+  private onDocUpdate = (update: Uint8Array, origin: unknown): void => {
     const encoder = encoding.createEncoder()
     encoding.writeVarUint(encoder, MSG_SYNC)
     syncProtocol.writeUpdate(encoder, update)
@@ -170,6 +231,8 @@ export interface RoomManagerOptions extends PersistenceOptions {
   storage: RoomStorage
   /** How long an empty room stays in memory before it is saved and unloaded. */
   idleUnloadMs: number
+  /** Largest allowed encoded document, in bytes. */
+  maxDocBytes: number
 }
 
 /**
@@ -256,10 +319,10 @@ export class RoomManager {
     const { storage, now, onError } = this.options
     const updates = await storage.load(id)
 
-    const room = new Room(id)
+    const room = new Room(id, this.options.maxDocBytes)
     for (const update of updates) {
       try {
-        Y.applyUpdate(room.doc, update, 'storage')
+        room.applyStored(update)
       } catch (error) {
         // One unreadable row should not make the whole room unopenable.
         onError(error, `reading a stored update for room ${id}`)

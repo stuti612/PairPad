@@ -1,4 +1,5 @@
-import { expect, test, type Browser, type Page } from '@playwright/test'
+import { expect, test, type Browser, type Page, type WebSocketRoute } from '@playwright/test'
+import WebSocket from 'ws'
 
 // Set SCREENSHOT_DIR to save a picture of each window at the end of a test.
 const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR
@@ -345,3 +346,196 @@ test.describe('presence', () => {
     }
   })
 })
+
+test.describe('reliability', () => {
+  const badge = (page: Page) => page.locator('.status')
+
+  /** Lets a test cut and restore one page's connection to the server. Call before navigating. */
+  async function networkSwitch(page: Page) {
+    let down = false
+    const open: Array<[WebSocketRoute, WebSocketRoute]> = []
+    await page.routeWebSocket(/\/ws\//, (ws) => {
+      if (down) {
+        void ws.close()
+        return
+      }
+      open.push([ws, ws.connectToServer()])
+    })
+    return {
+      async cut() {
+        down = true
+        for (const [pageSide, serverSide] of open.splice(0)) {
+          await pageSide.close()
+          await serverSide.close()
+        }
+      },
+      restore() {
+        down = false
+      },
+    }
+  }
+
+  async function openWithSwitch(browser: Browser) {
+    const alice = await (await browser.newContext()).newPage()
+    const network = await networkSwitch(alice)
+    await alice.goto('/')
+    await alice.getByRole('button', { name: 'New pad' }).click()
+    await expect(alice).toHaveURL(/\/pad\//)
+    const bob = await (await browser.newContext()).newPage()
+    await bob.goto(alice.url())
+    await expect(badge(alice)).toHaveText('Connected')
+    await expect(badge(bob)).toHaveText('Connected')
+    return { alice, bob, network }
+  }
+
+  test('edits made while disconnected merge when the connection returns', async ({ browser }) => {
+    const { alice, bob, network } = await openWithSwitch(browser)
+    await typeInto(alice, 'shared line')
+    await expectPadText(bob, 'shared line')
+
+    await network.cut()
+    await expect(badge(alice)).toHaveText('Reconnecting')
+    await expect(bob.getByRole('button', { name: '1 person here' })).toBeVisible()
+    await expect(alice.getByRole('button', { name: '1 person here' })).toBeVisible()
+
+    // Both keep typing; neither sees the other for now.
+    await alice.keyboard.type(' + alice offline')
+    await editor(bob).click()
+    await bob.keyboard.press('ControlOrMeta+Home')
+    await bob.keyboard.type('bob online + ')
+    await expectPadText(alice, 'shared line + alice offline')
+    await expectPadText(bob, 'bob online + shared line')
+    await snap(alice, 'status-reconnecting')
+
+    network.restore()
+    await expect(badge(alice)).toHaveText('Connected')
+    await expectPadText(alice, 'bob online + shared line + alice offline')
+    await expectPadText(bob, 'bob online + shared line + alice offline')
+    await expect(alice.getByRole('button', { name: '2 people here' })).toBeVisible()
+    await expect(bob.getByRole('button', { name: '2 people here' })).toBeVisible()
+  })
+
+  test('shows Offline when the browser has no network, and recovers', async ({ browser }) => {
+    const { alice, bob, network } = await openWithSwitch(browser)
+    await alice.context().setOffline(true)
+    await network.cut()
+    await expect(badge(alice)).toHaveText('Offline')
+
+    await typeInto(alice, 'written on a train')
+    await snap(alice, 'status-offline')
+    await alice.context().setOffline(false)
+    network.restore()
+    await expect(badge(alice)).toHaveText('Connected')
+    await expectPadText(bob, 'written on a train')
+  })
+
+  test('goes from Reconnecting to Offline when the outage drags on', async ({ browser }) => {
+    const { alice, network } = await openWithSwitch(browser)
+    await network.cut()
+    await expect(badge(alice)).toHaveText('Reconnecting')
+    await expect(badge(alice)).toHaveText('Offline', { timeout: 12_000 })
+    network.restore()
+    await expect(badge(alice)).toHaveText('Connected')
+  })
+
+  test('warns before closing a tab that holds unsent edits', async ({ browser }) => {
+    const { alice, network } = await openWithSwitch(browser)
+    const warnsOnLeave = () =>
+      alice.evaluate(() => {
+        const event = new Event('beforeunload', { cancelable: true })
+        window.dispatchEvent(event)
+        return event.defaultPrevented
+      })
+    expect(await warnsOnLeave()).toBe(false)
+
+    await network.cut()
+    await expect(badge(alice)).toHaveText('Reconnecting')
+    await typeInto(alice, 'not sent yet')
+    await expect.poll(warnsOnLeave).toBe(true)
+
+    network.restore()
+    await expect(badge(alice)).toHaveText('Connected')
+    await expect.poll(warnsOnLeave).toBe(false)
+  })
+})
+
+test.describe('limits', () => {
+  test('an 11th person sees that the pad is full and can join once someone leaves', async ({ page, baseURL }) => {
+    const roomId = `full${Math.random().toString(36).slice(2, 8)}`
+    const wsUrl = `${baseURL!.replace('http', 'ws')}/ws/${roomId}`
+    const sockets = Array.from({ length: 10 }, () => new WebSocket(wsUrl))
+    await Promise.all(sockets.map((socket) => new Promise((resolve) => socket.once('open', resolve))))
+
+    await page.goto(`/pad/${roomId}`)
+    await expect(page.getByRole('heading', { name: 'This pad is full' })).toBeVisible()
+    await expect(page.locator('.cm-content')).toHaveCount(0)
+    await snap(page, 'room-full')
+
+    // Still full: trying again lands on the same notice.
+    await page.getByRole('button', { name: 'Try again' }).click()
+    await expect(page.getByRole('heading', { name: 'This pad is full' })).toBeVisible()
+
+    sockets[0]!.close()
+    await expect(async () => {
+      await page.getByRole('button', { name: 'Try again' }).click({ timeout: 1000 })
+      await expect(editor(page)).toBeVisible({ timeout: 1000 })
+    }).toPass()
+    await expect(page.getByRole('status').filter({ hasText: 'Connected' })).toBeVisible()
+    for (const socket of sockets) socket.close()
+  })
+
+  test('the editor refuses text beyond the size limit but still lets you delete', async ({ browser }) => {
+    const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'] })
+    const page = await context.newPage()
+    await page.goto('/')
+    await page.getByRole('button', { name: 'New pad' }).click()
+    await expect(editor(page)).toBeVisible()
+    const paste = async (lines: number) => {
+      // Each line is 100 bytes including its line break.
+      await page.evaluate((n) => navigator.clipboard.writeText(('x'.repeat(99) + '\n').repeat(n)), lines)
+      await editor(page).click()
+      await page.keyboard.press('ControlOrMeta+End')
+      await page.keyboard.press('ControlOrMeta+v')
+    }
+    const lastLineNumber = () => page.locator('.cm-lineNumbers .cm-gutterElement').last().innerText()
+    const limitBanner = page.getByText('This pad is at its size limit')
+
+    // 950 kB in one go: over the limit, so nothing is inserted.
+    await paste(9_500)
+    await expect(limitBanner).toBeVisible()
+    await expect(page.locator('.cm-placeholder')).toBeVisible()
+
+    // 800 kB fits.
+    await paste(8_000)
+    await expect.poll(lastLineNumber).toBe('8001')
+
+    // Another 200 kB would not.
+    await paste(2_000)
+    await expect(limitBanner).toBeVisible()
+    await snap(page, 'size-limit')
+    await expect.poll(lastLineNumber).toBe('8001')
+
+    // Small edits and deleting still work, and the pad stays connected.
+    await page.keyboard.type('ok')
+    await page.keyboard.press('Backspace')
+    await expect(page.locator('.cm-activeLine')).toHaveText('o')
+    await expect(page.getByRole('status').filter({ hasText: 'Connected' })).toBeVisible()
+  })
+
+  test('explains when the server refuses a change for size, and stops editing', async ({ page }) => {
+    await page.routeWebSocket(/\/ws\//, async (ws) => {
+      // Stand in for the server turning down an oversized update.
+      await ws.close({ code: 4413, reason: 'document too large' })
+    })
+    await page.goto('/')
+    await page.getByRole('button', { name: 'New pad' }).click()
+
+    await expect(page.getByRole('alert')).toContainText('1 MB size limit')
+    await expect(editor(page)).toHaveAttribute('contenteditable', 'false')
+    await expect(page.getByRole('button', { name: 'Reload' })).toBeVisible()
+    await snap(page, 'too-large')
+    // It does not keep hammering the server with reconnects.
+    await expect(page.locator('.status')).toHaveCount(0)
+  })
+})
+

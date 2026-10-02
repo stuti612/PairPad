@@ -209,6 +209,121 @@ body {
   background: var(--surface-hover);
 }
 
+/* Connection status */
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+
+.status-connected .status-dot {
+  background: #34d399;
+}
+
+.status-connecting .status-dot,
+.status-reconnecting .status-dot {
+  background: #fbbf24;
+  animation: status-pulse 1.2s ease-in-out infinite;
+}
+
+.status-reconnecting {
+  border-color: rgba(251, 191, 36, 0.4);
+  color: #fbbf24;
+}
+
+.status-offline {
+  border-color: rgba(255, 138, 138, 0.4);
+  color: var(--danger);
+}
+
+.status-offline .status-dot {
+  background: var(--danger);
+}
+
+@keyframes status-pulse {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot {
+    animation: none !important;
+  }
+}
+
+/* Banners and notices */
+
+.banner {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: #1d2130;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.banner-error {
+  border-bottom-color: rgba(255, 138, 138, 0.35);
+  background: #2a1a1f;
+}
+
+.notice-page {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 18vh 24px 48px;
+  text-align: center;
+}
+
+.notice-page h1 {
+  margin: 0;
+  font-size: 26px;
+  letter-spacing: -0.01em;
+}
+
+.notice-page p {
+  max-width: 420px;
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.notice-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+}
+
+.button-secondary {
+  height: 40px;
+  padding: 0 20px;
+  font-size: 15px;
+}
+
 /* Presence */
 
 .presence {
@@ -365,5 +480,12 @@ body {
 
   .room-id {
     display: none;
+  }
+
+  /* The dot alone carries the state on a narrow screen; the label is in the tooltip. */
+  .status {
+    padding: 0 8px;
+    font-size: 0;
+    gap: 0;
   }
 }

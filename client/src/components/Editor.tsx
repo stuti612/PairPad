@@ -22,18 +22,31 @@ import type * as Y from 'yjs'
 import { editorTheme } from '../lib/editorTheme'
 import { languageExtension, type LanguageId } from '../lib/languages'
 import { remoteCursors } from '../lib/remoteCursors'
+import { sizeLimit } from '../lib/sizeLimit'
 
 interface EditorProps {
   text: Y.Text
   awareness: Awareness
   language: LanguageId
+  readOnly: boolean
+  /** Called when an edit of yours was blocked because the pad is full. */
+  onSizeLimit: () => void
 }
 
-export function Editor({ text, awareness, language }: EditorProps) {
+const readOnlyExtension = (readOnly: boolean) => [
+  EditorState.readOnly.of(readOnly),
+  EditorView.editable.of(!readOnly),
+]
+
+export function Editor({ text, awareness, language, readOnly, onSizeLimit }: EditorProps) {
   const host = useRef<HTMLDivElement>(null)
   const view = useRef<EditorView | null>(null)
   const languageConf = useRef(new Compartment())
   const initialLanguage = useRef(language)
+  const readOnlyConf = useRef(new Compartment())
+  const initialReadOnly = useRef(readOnly)
+  const sizeLimitHandler = useRef(onSizeLimit)
+  sizeLimitHandler.current = onSizeLimit
 
   useEffect(() => {
     const editor = new EditorView({
@@ -64,6 +77,8 @@ export function Editor({ text, awareness, language }: EditorProps) {
             indentWithTab,
           ]),
           languageConf.current.of(languageExtension(initialLanguage.current)),
+          readOnlyConf.current.of(readOnlyExtension(initialReadOnly.current)),
+          sizeLimit(() => sizeLimitHandler.current()),
           editorTheme,
           // y-codemirror.next binds the editor to the shared text and provides
           // undo; passing no awareness turns off its own cursor drawing in
@@ -86,6 +101,12 @@ export function Editor({ text, awareness, language }: EditorProps) {
       effects: languageConf.current.reconfigure(languageExtension(language)),
     })
   }, [language])
+
+  useEffect(() => {
+    view.current?.dispatch({
+      effects: readOnlyConf.current.reconfigure(readOnlyExtension(readOnly)),
+    })
+  }, [readOnly])
 
   return <div className="editor" ref={host} />
 }
