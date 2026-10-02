@@ -28,7 +28,7 @@ const editor = (page: Page) => page.locator('.cm-content')
 function padText(page: Page): Promise<string> {
   return editor(page).evaluate((content) => {
     const copy = content.cloneNode(true) as HTMLElement
-    copy.querySelectorAll('.cm-ySelectionCaret, .cm-placeholder').forEach((node) => node.remove())
+    copy.querySelectorAll('.cm-remoteCaret, .cm-placeholder').forEach((node) => node.remove())
     return [...copy.querySelectorAll('.cm-line')].map((line) => line.textContent).join('\n')
   })
 }
@@ -245,22 +245,62 @@ test.describe('presence', () => {
     await typeInto(alice, 'const answer = 42')
     await expectPadText(bob, 'const answer = 42')
 
-    const caret = bob.locator('.cm-ySelectionCaret')
+    const caret = bob.locator('.cm-remoteCaret')
     await expect(caret).toHaveCount(1)
     await expect(caret).toHaveCSS('border-left-color', 'rgb(244, 114, 182)')
-    await expect(bob.locator('.cm-ySelectionInfo')).toHaveText('Ada')
+    await expect(bob.locator('.cm-remoteCaretTag')).toHaveText('Ada')
     // Alice sees Bob's cursor, never a remote-style cursor for herself.
-    await expect(alice.locator('.cm-ySelectionInfo')).toHaveCount(1)
-    await expect(alice.locator('.cm-ySelectionInfo')).not.toHaveText('Ada')
+    await expect(alice.locator('.cm-remoteCaretTag')).toHaveCount(1)
+    await expect(alice.locator('.cm-remoteCaretTag')).not.toHaveText('Ada')
 
     await alice.keyboard.press('ControlOrMeta+a')
-    await expect(bob.locator('.cm-ySelection').first()).toBeVisible()
+    await expect(bob.locator('.cm-remoteSelection').first()).toBeVisible()
     await snap(bob, 'presence-bob')
     await openPresence(bob)
     await snap(bob, 'presence-bob-menu')
 
     await alice.close()
     await expect(caret).toHaveCount(0)
+  })
+
+  test('the name tag on a remote cursor fades out and returns when they type again', async ({ browser }) => {
+    const { alice, bob } = await openTwoWindows(browser)
+    const tagOpacity = () =>
+      bob.locator('.cm-remoteCaretTag').evaluate((tag) => Number(getComputedStyle(tag).opacity))
+
+    await typeInto(alice, 'first line')
+    await expectPadText(bob, 'first line')
+    expect(await tagOpacity()).toBeGreaterThan(0.9)
+    // Once it has faded it no longer hides the text above the cursor.
+    await expect.poll(tagOpacity, { timeout: 5000 }).toBe(0)
+
+    await alice.keyboard.type(' and more')
+    await expectPadText(bob, 'first line and more')
+    expect(await tagOpacity()).toBeGreaterThan(0.9)
+    await expect.poll(tagOpacity, { timeout: 5000 }).toBe(0)
+
+    // Bob typing on the same line does not make Alice's tag flash back.
+    await editor(bob).click()
+    await bob.keyboard.press('ControlOrMeta+Home')
+    await bob.keyboard.type('bob was here ')
+    await expectPadText(alice, 'bob was here first line and more')
+    expect(await tagOpacity()).toBe(0)
+
+    // Moving without typing counts as activity too.
+    await alice.keyboard.press('ControlOrMeta+Home')
+    await expect.poll(tagOpacity).toBeGreaterThan(0.9)
+  })
+
+  test('a rename updates the name tag on your cursor for others', async ({ browser }) => {
+    const { alice, bob } = await openTwoWindows(browser)
+    await typeInto(alice, 'hello')
+    await expectPadText(bob, 'hello')
+    const tag = bob.locator('.cm-remoteCaretTag')
+    await expect(tag).toHaveCount(1)
+
+    await openPresence(alice)
+    await myName(alice).fill('Grace Hopper')
+    await expect(tag).toHaveText('Grace Hopper')
   })
 
   test('two people who were given the same random color end up with different ones', async ({ browser }) => {

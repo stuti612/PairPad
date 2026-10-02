@@ -49,23 +49,6 @@ const theme = EditorView.theme(
     },
     '.cm-panels input, .cm-panels button': { fontFamily: 'inherit' },
     '.cm-placeholder': { color: 'var(--faint)' },
-    // Remote cursors (y-codemirror.next). The name tag is always visible
-    // rather than hover-only, so you can tell at a glance who is where.
-    '.cm-ySelectionCaret': { borderLeftWidth: '2px', borderRightWidth: '0', marginRight: '-1px' },
-    '.cm-ySelectionCaretDot': { display: 'none' },
-    '.cm-ySelectionInfo': {
-      top: '-1.35em',
-      left: '-2px',
-      padding: '0 5px',
-      borderRadius: '4px 4px 4px 0',
-      color: 'var(--accent-text)',
-      fontFamily: 'var(--font-sans)',
-      fontSize: '11px',
-      fontWeight: '600',
-      lineHeight: '1.5',
-      opacity: '1',
-      pointerEvents: 'none',
-    },
   },
   { dark: true },
 )

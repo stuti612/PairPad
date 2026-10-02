@@ -21,6 +21,7 @@ import type { Awareness } from 'y-protocols/awareness'
 import type * as Y from 'yjs'
 import { editorTheme } from '../lib/editorTheme'
 import { languageExtension, type LanguageId } from '../lib/languages'
+import { remoteCursors } from '../lib/remoteCursors'
 
 interface EditorProps {
   text: Y.Text
@@ -64,9 +65,11 @@ export function Editor({ text, awareness, language }: EditorProps) {
           ]),
           languageConf.current.of(languageExtension(initialLanguage.current)),
           editorTheme,
-          // Binds the editor to the shared text and draws remote cursors
-          // and selections from awareness.
-          yCollab(text, awareness),
+          // y-codemirror.next binds the editor to the shared text and provides
+          // undo; passing no awareness turns off its own cursor drawing in
+          // favor of ours (see remoteCursors.ts for why).
+          yCollab(text, null),
+          remoteCursors(text, awareness),
         ],
       }),
     })
