@@ -11,7 +11,10 @@ const defaultStaticDir = path.resolve(import.meta.dirname, '../../client/dist')
 const staticDir = process.env.STATIC_DIR ?? defaultStaticDir
 const hasFrontend = existsSync(path.join(staticDir, 'index.html'))
 
-const { storage, description } = await storageFromEnv()
+const { storage, description } = await storageFromEnv().catch((error: Error) => {
+  console.error(error.message)
+  process.exit(1)
+})
 const server = createPairPadServer({
   staticDir: hasFrontend ? staticDir : undefined,
   storage,

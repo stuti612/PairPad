@@ -1,0 +1,22 @@
+# Replit configuration. See the "Deploying on Replit" section of the README.
+
+modules = ["nodejs-22"]
+
+# The Run button in the workspace: build, then serve everything on one port,
+# the same way the deployment does.
+run = "npm run build && npm start"
+
+[nix]
+channel = "stable-24_11"
+
+[[ports]]
+localPort = 3001
+externalPort = 80
+
+[deployment]
+# "gce" is a Reserved VM: one always-on machine, which is what in-memory
+# rooms and long-lived WebSockets need. Do not switch to Autoscale.
+deploymentTarget = "gce"
+# Dev dependencies are needed to build (TypeScript, Vite).
+build = ["sh", "-c", "npm ci --include=dev && npm run build"]
+run = ["sh", "-c", "npm start"]

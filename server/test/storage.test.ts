@@ -4,6 +4,7 @@ import path from 'node:path'
 import { PGlite } from '@electric-sql/pglite'
 import { PGLiteSocketServer } from '@electric-sql/pglite-socket'
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { storageFromEnv } from '../src/storage/index.js'
 import { MemoryStorage } from '../src/storage/memory.js'
 import { connectPostgres, PostgresStorage, type PostgresClient } from '../src/storage/postgres.js'
 import { SqliteStorage } from '../src/storage/sqlite.js'
@@ -195,4 +196,28 @@ describe.each(backends)('$name storage', (backend) => {
     await storage.compact('room0001', bytes(1), 900)
     expect(await storage.deleteInactive(500)).toEqual(['room0001'])
   })
+})
+
+describe('choosing storage from the environment', () => {
+  it('uses SQLite when no database URL is given', async () => {
+    const { storage, description } = await storageFromEnv({ SQLITE_PATH: ':memory:' })
+    expect(storage).toBeInstanceOf(SqliteStorage)
+    expect(description).toContain('SQLite')
+  })
+
+  it('uses Postgres when a database URL is given, without logging the credentials', async () => {
+    const { storage, description } = await storageFromEnv({
+      DATABASE_URL: 'postgres://user:secret@db.invalid:5432/pads',
+    })
+    expect(storage).toBeInstanceOf(PostgresStorage)
+    expect(description).toBe('Postgres')
+    await storage.close()
+  })
+
+  it.each(['REPLIT_DEPLOYMENT', 'REQUIRE_POSTGRES'])(
+    'refuses to fall back to a local file in a deployment (%s)',
+    async (flag) => {
+      await expect(storageFromEnv({ [flag]: '1' })).rejects.toThrow('DATABASE_URL is not set')
+    },
+  )
 })
