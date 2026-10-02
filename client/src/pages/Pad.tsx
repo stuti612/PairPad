@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { Editor } from '../components/Editor'
 import { TopBar } from '../components/TopBar'
 import { usePad, useSharedLanguage, type PadSession } from '../lib/usePad'
+import { usePresence } from '../lib/usePresence'
 
 export function Pad({ roomId }: { roomId: string }) {
   const session = usePad(roomId)
@@ -19,11 +20,17 @@ export function Pad({ roomId }: { roomId: string }) {
 
 function PadView({ roomId, session }: { roomId: string; session: PadSession }) {
   const [language, setLanguage] = useSharedLanguage(session.meta)
+  const presence = usePresence(session.provider.awareness)
 
   return (
     <div className="pad">
-      <TopBar roomId={roomId} language={language} onLanguageChange={setLanguage} />
-      <Editor text={session.text} language={language} />
+      <TopBar
+        roomId={roomId}
+        language={language}
+        onLanguageChange={setLanguage}
+        presence={presence}
+      />
+      <Editor text={session.text} awareness={session.provider.awareness} language={language} />
     </div>
   )
 }

@@ -17,16 +17,18 @@ import {
 } from '@codemirror/view'
 import { useEffect, useRef } from 'react'
 import { yCollab, yUndoManagerKeymap } from 'y-codemirror.next'
+import type { Awareness } from 'y-protocols/awareness'
 import type * as Y from 'yjs'
 import { editorTheme } from '../lib/editorTheme'
 import { languageExtension, type LanguageId } from '../lib/languages'
 
 interface EditorProps {
   text: Y.Text
+  awareness: Awareness
   language: LanguageId
 }
 
-export function Editor({ text, language }: EditorProps) {
+export function Editor({ text, awareness, language }: EditorProps) {
   const host = useRef<HTMLDivElement>(null)
   const view = useRef<EditorView | null>(null)
   const languageConf = useRef(new Compartment())
@@ -62,7 +64,9 @@ export function Editor({ text, language }: EditorProps) {
           ]),
           languageConf.current.of(languageExtension(initialLanguage.current)),
           editorTheme,
-          yCollab(text, null),
+          // Binds the editor to the shared text and draws remote cursors
+          // and selections from awareness.
+          yCollab(text, awareness),
         ],
       }),
     })
@@ -72,7 +76,7 @@ export function Editor({ text, language }: EditorProps) {
       editor.destroy()
       view.current = null
     }
-  }, [text])
+  }, [text, awareness])
 
   useEffect(() => {
     view.current?.dispatch({

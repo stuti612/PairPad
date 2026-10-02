@@ -209,6 +209,149 @@ body {
   background: var(--surface-hover);
 }
 
+/* Presence */
+
+.presence {
+  position: relative;
+}
+
+.presence-toggle {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 16px;
+  background: none;
+  cursor: pointer;
+}
+
+.presence-toggle:hover,
+.presence-toggle[aria-expanded='true'] {
+  background: var(--surface-hover);
+}
+
+.avatar {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: 2px solid var(--surface);
+  border-radius: 50%;
+  box-sizing: content-box;
+  color: var(--accent-text);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.presence-toggle .avatar + .avatar {
+  margin-left: -8px;
+}
+
+.avatar-more {
+  background: var(--border);
+  color: var(--text);
+}
+
+.presence-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 10;
+  width: 260px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+
+.presence-panel h2 {
+  margin: 0 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.presence-list {
+  max-height: 240px;
+  margin: 0 -4px;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.presence-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px;
+}
+
+.presence-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.presence-you {
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.identity-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.identity-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.identity-form input {
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+.swatches {
+  display: flex;
+  justify-content: space-between;
+}
+
+.swatch {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.swatch[aria-checked='true'] {
+  box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--text);
+}
+
 .editor {
   flex: 1;
   min-height: 0;

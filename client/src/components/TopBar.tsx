@@ -1,14 +1,17 @@
 import { useEffect, useRef, useState } from 'react'
 import { LANGUAGES, type LanguageId } from '../lib/languages'
+import type { Presence } from '../lib/usePresence'
 import { onLinkClick } from '../router'
+import { PresenceMenu } from './PresenceMenu'
 
 interface TopBarProps {
   roomId: string
   language: LanguageId
   onLanguageChange: (language: LanguageId) => void
+  presence: Presence
 }
 
-export function TopBar({ roomId, language, onLanguageChange }: TopBarProps) {
+export function TopBar({ roomId, language, onLanguageChange, presence }: TopBarProps) {
   return (
     <header className="topbar">
       <a className="brand" href="/" onClick={onLinkClick}>
@@ -19,6 +22,7 @@ export function TopBar({ roomId, language, onLanguageChange }: TopBarProps) {
       </span>
       <CopyLinkButton />
       <div className="topbar-spacer" />
+      <PresenceMenu {...presence} />
       <label className="language-picker">
         <span className="visually-hidden">Language</span>
         <select
