@@ -5,7 +5,11 @@ import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
 import { WebSocket } from 'ws'
 import { MSG_AWARENESS, MSG_SYNC, TEXT_KEY } from '../src/protocol.js'
-import { createPairPadServer, type PairPadServer } from '../src/server.js'
+import {
+  createPairPadServer,
+  type PairPadServer,
+  type PairPadServerOptions,
+} from '../src/server.js'
 
 export interface TestServer {
   server: PairPadServer
@@ -14,8 +18,8 @@ export interface TestServer {
   wsUrl: string
 }
 
-export async function startTestServer(): Promise<TestServer> {
-  const server = createPairPadServer()
+export async function startTestServer(options: PairPadServerOptions = {}): Promise<TestServer> {
+  const server = createPairPadServer(options)
   const port = await server.listen(0, '127.0.0.1')
   return {
     server,

@@ -4,6 +4,7 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { generateRoomId, isValidRoomId } from './ids.js'
 import { CLOSE_MALFORMED } from './protocol.js'
 import { RoomManager } from './room.js'
+import { serveStatic } from './static.js'
 
 const WS_PATH_PREFIX = '/ws/'
 const HEARTBEAT_INTERVAL_MS = 30_000
@@ -15,12 +16,28 @@ export interface PairPadServer {
   close(): Promise<void>
 }
 
-export function createPairPadServer(): PairPadServer {
+export interface PairPadServerOptions {
+  /** Directory holding the built frontend. Omit to run as an API-only server. */
+  staticDir?: string
+}
+
+export function createPairPadServer(options: PairPadServerOptions = {}): PairPadServer {
+  const { staticDir } = options
   const rooms = new RoomManager()
   const wss = new WebSocketServer({ noServer: true })
   const alive = new WeakMap<WebSocket, boolean>()
 
   const httpServer = http.createServer((req, res) => {
+    handleRequest(req, res).catch(() => {
+      if (res.headersSent) res.destroy()
+      else sendJson(res, 500, { error: 'internal error' })
+    })
+  })
+
+  async function handleRequest(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): Promise<void> {
     const { pathname } = new URL(req.url ?? '/', 'http://localhost')
 
     if (req.method === 'POST' && pathname === '/api/rooms') {
@@ -34,8 +51,13 @@ export function createPairPadServer(): PairPadServer {
         clients: rooms.clientCount,
       })
     }
+    const isPage = req.method === 'GET' || req.method === 'HEAD'
+    const reserved = pathname.startsWith('/api/') || pathname.startsWith(WS_PATH_PREFIX)
+    if (staticDir && isPage && !reserved && (await serveStatic(staticDir, pathname, req, res))) {
+      return
+    }
     sendJson(res, 404, { error: 'not found' })
-  })
+  }
 
   httpServer.on('upgrade', (req, socket, head) => {
     const roomId = roomIdFromUrl(req.url)
