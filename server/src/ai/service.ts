@@ -1,11 +1,13 @@
 import * as Y from 'yjs'
 import { TEXT_KEY } from '../protocol.js'
 import type { Room } from '../room.js'
+import { judge, type Verdict } from './judge.js'
 import { AiError, type LlmClient } from './llm.js'
 import { AiPresence } from './presence.js'
 import { GENERATION_SYSTEM, generationPrompt, SuggestionSchema } from './prompts.js'
 import { AiQuota, type QuotaLimits, type QuotaStatus } from './quota.js'
 import { SuggestionStore, type Suggestion } from './suggestions.js'
+import { checkSyntax, type SyntaxResult } from './syntax.js'
 
 // Free tiers allow only a few thousand tokens per minute, so what is sent to
 // the model is bounded: the selection itself, plus surrounding code.
@@ -14,6 +16,8 @@ export const MAX_TARGET_CHARS = 8_000
 const MAX_CONTEXT_CHARS = 12_000
 const MAX_AUTHOR_CHARS = 40
 const GENERATION_MAX_TOKENS = 4_096
+// The first attempt, plus one retry that is told why the first was turned down.
+const MAX_ATTEMPTS = 2
 
 export interface AiServiceOptions {
   llm: LlmClient
@@ -148,6 +152,13 @@ export class AiService {
     return suggestion
   }
 
+  /**
+   * The verify-then-show gate. Each attempt writes a candidate, checks that
+   * the pad still parses (JavaScript/TypeScript), then has the judge model
+   * score it. Only a candidate that passes both is shown. A failed attempt
+   * is retried once, with the reasons fed back; if that fails too, people
+   * see why instead of a doubtful diff.
+   */
   private async run(
     room: Room,
     store: SuggestionStore,
@@ -155,42 +166,107 @@ export class AiService {
     { from, to }: { from: number; to: number },
   ): Promise<void> {
     const text = room.doc.getText(TEXT_KEY)
+    // Everything is judged against the pad as it was when the request came in.
     const content = text.toString()
+    const original = content.slice(from, to)
+    const { language, instruction } = suggestion
     const presence = new AiPresence(room)
     const abort = new AbortController()
     this.aborts.add(abort)
     const timer = setTimeout(() => abort.abort(), this.options.timeoutMs)
+    const call = { timeoutMs: this.options.timeoutMs, signal: abort.signal }
+    const setPhase = (phase: string) => {
+      presence.show(text, from, to, phase)
+      store.update(suggestion.id, { phase, updatedAt: this.now() })
+    }
+
     try {
-      presence.show(text, from, to, 'Writing a suggestion')
-      const result = await this.options.llm.complete({
-        role: 'generate',
-        system: GENERATION_SYSTEM,
-        prompt: generationPrompt({
-          language: suggestion.language,
-          instruction: suggestion.instruction,
-          ...surroundings(content, from, to),
-        }),
-        schema: SuggestionSchema,
-        schemaName: 'suggestion',
-        maxTokens: GENERATION_MAX_TOKENS,
-        timeoutMs: this.options.timeoutMs,
-        signal: abort.signal,
-      })
+      let failures: string[] = []
+      let syntax: SyntaxResult | null = null
+      let verdict: Verdict | null = null
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        const retry = attempt > 1
+        setPhase(retry ? 'Trying again' : 'Writing a suggestion')
+        const candidate = await this.options.llm.complete({
+          role: 'generate',
+          system: GENERATION_SYSTEM,
+          prompt: generationPrompt({
+            language,
+            instruction,
+            ...surroundings(content, from, to),
+            previousFailures: retry ? failures : undefined,
+          }),
+          schema: SuggestionSchema,
+          schemaName: 'suggestion',
+          maxTokens: GENERATION_MAX_TOKENS,
+          ...call,
+        })
+
+        setPhase(retry ? 'Checking it again' : 'Checking it')
+        const result = content.slice(0, from) + candidate.replacement + content.slice(to)
+        syntax = checkSyntax(language, content, result)
+        verdict = null
+        failures = []
+        if (syntax.status === 'failed') {
+          // No point asking the judge about code that doesn't parse.
+          failures = [syntax.message]
+        } else {
+          try {
+            verdict = await judge(
+              this.options.llm,
+              {
+                language,
+                instruction,
+                original,
+                proposed: candidate.replacement,
+                before: content.slice(0, from),
+                after: content.slice(to),
+              },
+              call,
+            )
+            failures = verdict.reasons
+          } catch (error) {
+            // An unusable judge answer counts against the attempt; anything
+            // else (busy, timeout) ends the request below.
+            if (!(error instanceof AiError && error.kind === 'format')) throw error
+            failures = [`The automatic check could not be completed: ${error.message}`]
+          }
+        }
+
+        if (failures.length === 0 && verdict) {
+          store.update(suggestion.id, {
+            status: 'pending',
+            phase: null,
+            proposedText: candidate.replacement,
+            summary: candidate.summary,
+            score: verdict.score,
+            checks: verdict.checks,
+            syntax,
+            attempts: attempt,
+            updatedAt: this.now(),
+          })
+          return
+        }
+      }
+
       store.update(suggestion.id, {
-        status: 'pending',
+        status: 'failed',
         phase: null,
-        proposedText: result.replacement,
-        summary: result.summary,
+        score: verdict?.score ?? null,
+        checks: verdict?.checks ?? [],
+        syntax,
+        attempts: MAX_ATTEMPTS,
+        failureReasons: failures,
         updatedAt: this.now(),
       })
     } catch (error) {
       const message = this.shuttingDown
         ? 'The server restarted while the AI was working. Ask again.'
         : abort.signal.aborted
-        ? 'The AI took too long and the request was stopped. Try again.'
-        : error instanceof AiError
-          ? error.message
-          : 'The AI request failed unexpectedly.'
+          ? 'The AI took too long and the request was stopped. Try again.'
+          : error instanceof AiError
+            ? error.message
+            : 'The AI request failed unexpectedly.'
       store.update(suggestion.id, {
         status: 'failed',
         phase: null,

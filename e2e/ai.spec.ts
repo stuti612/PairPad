@@ -146,3 +146,44 @@ test('a suggestion goes out of date when its code is edited, and cannot be accep
   expect(await padText(bob)).toBe(CODE.replace('a + b', 'a + b // edited'))
   await snap(bob, 'ai-stale')
 })
+
+test("the checks' score and reasons are shown with the suggestion", async ({ browser }) => {
+  const { alice, bob } = await openPadWithCode(browser)
+  await ask(alice, 'add input validation')
+  const suggestion = card(bob, 'add input validation')
+  await expect(suggestion).toHaveAttribute('data-status', 'pending')
+  // The mock judge scores 0.9, 0.9 and 0.95.
+  await expect(suggestion.locator('.ai-score')).toHaveText('Score 0.92')
+  await expect(suggestion.locator('.ai-check-name')).toHaveText([
+    'Does what was asked',
+    'Minimal and in scope',
+    'Safe',
+  ])
+  await expect(suggestion).toContainText('The code still parses.')
+  await expect(bob.locator('.cm-ai-header')).toContainText('Score 0.92')
+})
+
+test('a first attempt that does not parse is retried before anyone sees it', async ({ browser }) => {
+  const { alice, bob } = await openPadWithCode(browser)
+  await ask(alice, 'add input validation [bad syntax]')
+  const suggestion = card(bob, 'add input validation [bad syntax]')
+  await expect(suggestion).toContainText(/Trying again|Checking it again/)
+  await expect(suggestion).toHaveAttribute('data-status', 'pending')
+  await expect(suggestion).toContainText('Passed on the second try')
+  // Only the corrected version is shown.
+  await expect(bob.locator('.cm-ai-added-line')).toHaveText(['// PairPad AI: add input validation'])
+})
+
+test("shows the reasons, not a diff, when the AI can't produce a confident suggestion", async ({ browser }) => {
+  const { alice, bob } = await openPadWithCode(browser)
+  await ask(alice, 'add input validation [low score]')
+  const suggestion = card(bob, 'add input validation [low score]')
+  await expect(suggestion).toHaveAttribute('data-status', 'failed', { timeout: 10_000 })
+  await expect(suggestion).toContainText("AI couldn't produce a confident suggestion.")
+  await expect(suggestion).toContainText('The average score, 0.37, is below 0.70.')
+  await expect(suggestion.locator('.ai-score')).toHaveText('Score 0.37')
+  await expect(bob.locator('.cm-ai-header')).toHaveCount(0)
+  expect(await padText(bob)).toBe(CODE)
+  await snap(bob, 'ai-failed')
+})
+

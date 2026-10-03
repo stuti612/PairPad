@@ -13,15 +13,26 @@ export class ScriptedLlm implements LlmClient {
   readonly label = 'Scripted'
   readonly requests: StructuredRequest<unknown>[] = []
   private readonly queues: Record<ModelRole, Reply[]> = { generate: [], judge: [] }
+  private readonly defaults: Partial<Record<ModelRole, Reply>> = {}
 
   reply(role: ModelRole, ...replies: Reply[]): this {
     this.queues[role].push(...replies)
     return this
   }
 
+  /** Used whenever the role's queue is empty. */
+  replyByDefault(role: ModelRole, reply: Reply): this {
+    this.defaults[role] = reply
+    return this
+  }
+
+  calls(role: ModelRole): number {
+    return this.requests.filter((request) => request.role === role).length
+  }
+
   async complete<T>(request: StructuredRequest<T>): Promise<T> {
     this.requests.push(request as StructuredRequest<unknown>)
-    const next = this.queues[request.role].shift()
+    const next = this.queues[request.role].shift() ?? this.defaults[request.role]
     if (next === undefined) throw new AiError(`no scripted ${request.role} reply left`, 'rejected')
     if (next instanceof Error) throw next
     const value = typeof next === 'function' ? await next(request as StructuredRequest<unknown>) : next
@@ -97,4 +108,16 @@ export function completion(content: string, finishReason = 'stop') {
 
 export function apiError(status: number, message = 'error') {
   return { status, body: { error: { message, type: 'error' } } }
+}
+
+/** A judge answer giving each criterion the score given (default: a clear pass). */
+export function judgement(
+  scores: { asked?: number; minimal?: number; safe?: number } = {},
+  reasons: { asked?: string; minimal?: string; safe?: string } = {},
+) {
+  return {
+    does_what_was_asked: { score: scores.asked ?? 0.9, reason: reasons.asked ?? 'Does what was asked.' },
+    minimal_and_in_scope: { score: scores.minimal ?? 0.9, reason: reasons.minimal ?? 'Changes only what is needed.' },
+    safe: { score: scores.safe ?? 1, reason: reasons.safe ?? 'Nothing risky.' },
+  }
 }

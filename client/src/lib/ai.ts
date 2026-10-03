@@ -24,6 +24,8 @@ export interface Suggestion {
   summary: string
   score: number | null
   checks: Check[]
+  syntax: { status: 'passed' | 'failed' | 'skipped'; message: string } | null
+  attempts: number
   failureReasons: string[]
   createdAt: number
   updatedAt: number

@@ -39,6 +39,10 @@ export interface Suggestion {
   /** Average of the checks, 0 to 1, once checked. */
   score: number | null
   checks: Check[]
+  /** Result of the syntax check (JavaScript and TypeScript only). */
+  syntax: { status: 'passed' | 'failed' | 'skipped'; message: string } | null
+  /** Model attempts used: 1, or 2 when the first was turned down by the checks. */
+  attempts: number
   /** Why it was not shown as a suggestion, when status is "failed". */
   failureReasons: string[]
   createdAt: number
@@ -120,6 +124,8 @@ export class SuggestionStore {
       summary: '',
       score: null,
       checks: [],
+      syntax: null,
+      attempts: 0,
       failureReasons: [],
       createdAt: now,
       updatedAt: now,

@@ -9,6 +9,9 @@ const DELAY_MS = 700
  * An instruction containing "[low score]" gets failing scores instead, so the
  * failure path can be exercised too.
  *
+ * An instruction containing "[bad syntax]" gets code that doesn't parse on
+ * the first attempt and valid code on the retry, to show the gate at work.
+ *
  * It reads the prompts built in prompts.ts (and the judge's), so it changes
  * along with them.
  */
@@ -25,9 +28,12 @@ export class MockLlm implements LlmClient {
       const target = region.startsWith('(empty') ? '' : region
       const indent = /^[ \t]*/.exec(target)?.[0] ?? ''
       const marker = language === 'Python' ? '#' : '//'
-      const comment = `${indent}${marker} PairPad AI: ${instruction.replace('[low score]', '').trim()}`
+      const label = instruction.replace(/\[(low score|bad syntax)\]/g, '').trim()
+      const comment = `${indent}${marker} PairPad AI: ${label}`
+      const retrying = request.prompt.includes('A previous attempt')
+      const broken = instruction.includes('[bad syntax]') && !retrying ? '\n{' : ''
       return request.schema.parse({
-        replacement: target === '' ? comment : `${comment}\n${target}`,
+        replacement: (target === '' ? comment : `${comment}\n${target}`) + broken,
         summary: `Added a note about "${instruction}".`,
       })
     }

@@ -5,7 +5,7 @@ import { AI_COLOR, AI_NAME } from '../src/ai/presence.js'
 import { AiService } from '../src/ai/service.js'
 import type { Suggestion } from '../src/ai/suggestions.js'
 import type { PairPadServerOptions } from '../src/server.js'
-import { deferred, ScriptedLlm } from './aiHelpers.js'
+import { deferred, judgement, ScriptedLlm } from './aiHelpers.js'
 import { startTestServer, TestClient, waitFor, type TestServer } from './helpers.js'
 
 export const ROOM = 'airoom01'
@@ -26,6 +26,9 @@ async function start(
   options: PairPadServerOptions = {},
   quota = { perRoomPerHour: 10, perDay: 100 },
 ) {
+  // These tests are about the flow around the gate, so the judge passes
+  // everything unless a test says otherwise (see aiGate.test.ts).
+  llm.replyByDefault('judge', judgement())
   ai = new AiService({ llm, quota, timeoutMs: 5_000 })
   ts = await startTestServer({ ai, ...options })
   return ai
@@ -208,7 +211,7 @@ describe('asking the AI for a change', () => {
     const body = (await third.json()) as Record<string, any>
     expect(body.error).toMatch(/used its 2 AI requests for the hour/)
     expect(body.quota.room.remaining).toBe(0)
-    expect(llm.requests).toHaveLength(2)
+    expect(llm.calls('generate')).toBe(2)
 
     const info = (await (await fetch(`${ts.httpUrl}/api/rooms/${ROOM}/ai`)).json()) as Record<string, any>
     expect(info).toMatchObject({ enabled: true, provider: 'Scripted', busy: false })
@@ -410,7 +413,8 @@ describe('suggestions belong to the server', () => {
 
     await waitFor(() => seen(bob, id)?.proposedText === 'x = 1' && !bob.doc.getMap('suggestions').has('fake00000001'))
     await waitFor(() => seen(alice, id)?.proposedText === 'x = 1')
-    expect(seen(alice, id)!.score).toBeNull()
+    // The judge's real score (0.9, 0.9 and 1.0 average 0.93), not the faked 1.
+    expect(seen(alice, id)!.score).toBe(0.93)
     expect((await decide('fake00000001', 'accept')).status).toBe(404)
     expect((await decide(id, 'accept')).status).toBe(200)
     expect(serverText()).toBe('x = 1')

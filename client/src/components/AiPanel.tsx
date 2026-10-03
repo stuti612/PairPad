@@ -219,6 +219,9 @@ function SuggestionCard({
       </button>
       <p className="ai-card-meta">Asked by {suggestion.author}</p>
       {suggestion.summary && status !== 'failed' && <p className="ai-card-summary">{suggestion.summary}</p>}
+      {(status === 'pending' || status === 'stale' || status === 'accepted') && (
+        <Verification suggestion={suggestion} />
+      )}
       {suggestion.checks.length > 0 && (
         <ul className="ai-checks">
           {suggestion.checks.map((check) => (
@@ -280,6 +283,15 @@ function SuggestionCard({
       )}
     </article>
   )
+}
+
+/** How the suggestion got past the checks, shown above the scores. */
+function Verification({ suggestion }: { suggestion: Suggestion }) {
+  const notes: string[] = []
+  if (suggestion.syntax?.status === 'passed') notes.push(suggestion.syntax.message)
+  if (suggestion.attempts > 1) notes.push('Passed on the second try, after the first was turned down.')
+  if (notes.length === 0) return null
+  return <p className="ai-card-note">{notes.join(' ')}</p>
 }
 
 const STATUS_LABELS: Record<Suggestion['status'], string> = {
