@@ -27,7 +27,9 @@ export function PresenceMenu({ me, peers, updateMe }: Presence) {
 
   const shown = peers.slice(0, MAX_AVATARS)
   const hidden = peers.length - shown.length
-  const summary = `${peers.length} ${peers.length === 1 ? 'person' : 'people'} here`
+  const people = peers.filter((peer) => !peer.isAi).length
+  const aiHere = peers.some((peer) => peer.isAi)
+  const summary = `${people} ${people === 1 ? 'person' : 'people'} here${aiHere ? ', plus PairPad AI' : ''}`
 
   return (
     <div className="presence" ref={root}>
@@ -47,13 +49,14 @@ export function PresenceMenu({ me, peers, updateMe }: Presence) {
       </button>
       {open && (
         <div className="presence-panel" id={panelId}>
-          <h2>Who's here ({peers.length})</h2>
+          <h2>Who's here ({people})</h2>
           <ul className="presence-list">
             {peers.map((peer) => (
               <li key={peer.clientId}>
                 <Avatar peer={peer} />
                 <span className="presence-name">{peer.name}</span>
                 {peer.isSelf && <span className="presence-you">you</span>}
+                {peer.isAi && <span className="presence-you">AI</span>}
               </li>
             ))}
           </ul>
@@ -66,8 +69,12 @@ export function PresenceMenu({ me, peers, updateMe }: Presence) {
 
 function Avatar({ peer }: { peer: Peer }) {
   return (
-    <span className="avatar" style={{ backgroundColor: peer.color }} aria-hidden="true">
-      {initials(peer.name)}
+    <span
+      className={`avatar${peer.isAi ? ' avatar-ai' : ''}`}
+      style={{ backgroundColor: peer.color }}
+      aria-hidden="true"
+    >
+      {peer.isAi ? 'AI' : initials(peer.name)}
     </span>
   )
 }

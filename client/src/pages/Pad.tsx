@@ -1,6 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Editor } from '../components/Editor'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { AiPanel, type Selection } from '../components/AiPanel'
+import { Editor, type EditorHandle } from '../components/Editor'
 import { TopBar } from '../components/TopBar'
+import { decideSuggestion } from '../lib/ai'
+import { useAiInfo, useSuggestions } from '../lib/useSuggestions'
 import { useConnection, type Blocked } from '../lib/useConnection'
 import { usePad, useSharedLanguage, type PadSession } from '../lib/usePad'
 import { usePresence } from '../lib/usePresence'
@@ -25,6 +28,37 @@ function PadView({ roomId, session }: { roomId: string; session: PadSession }) {
   const presence = usePresence(session.provider.awareness)
   const connection = useConnection(session)
   const [atSizeLimit, flagSizeLimit] = useTransientFlag(5000)
+  const [aiOpen, setAiOpen] = useRememberedFlag('pairpad:ai-panel-open')
+  const [aiInfo, refreshAi] = useAiInfo(roomId)
+  const suggestions = useSuggestions(session.doc)
+  const [selection, setSelection] = useState<Selection>({ from: 0, to: 0 })
+  const [decisionError, setDecisionError] = useState<string | null>(null)
+  const editor = useRef<EditorHandle>(null)
+  const connected = connection.status === 'connected'
+  const me = presence.me.name
+
+  const openSuggestions = useMemo(
+    () => suggestions.filter((suggestion) => suggestion.status === 'pending' || suggestion.status === 'stale'),
+    [suggestions],
+  )
+
+  // Accept and Reject from the bar drawn inside the editor.
+  const diffHandlers = useMemo(() => {
+    const decide = (id: string, action: 'accept' | 'reject') => {
+      setDecisionError(null)
+      decideSuggestion(roomId, id, action, me).catch((error: Error) => setDecisionError(error.message))
+    }
+    return {
+      accept: (id: string) => decide(id, 'accept'),
+      reject: (id: string) => decide(id, 'reject'),
+    }
+  }, [roomId, me])
+
+  useEffect(() => {
+    if (!decisionError) return
+    const timer = window.setTimeout(() => setDecisionError(null), 6000)
+    return () => window.clearTimeout(timer)
+  }, [decisionError])
 
   if (connection.blocked === 'room-full') {
     return (
@@ -61,6 +95,9 @@ function PadView({ roomId, session }: { roomId: string; session: PadSession }) {
         status={connection.status}
         unsynced={connection.unsynced}
         stopped={connection.blocked !== null}
+        aiOpen={aiOpen}
+        onToggleAi={() => setAiOpen(!aiOpen)}
+        openSuggestions={openSuggestions.length}
       />
       {connection.blocked && <StoppedBanner reason={connection.blocked} />}
       {!connection.blocked && atSizeLimit && (
@@ -68,13 +105,38 @@ function PadView({ roomId, session }: { roomId: string; session: PadSession }) {
           This pad is at its size limit (about 1 MB). Delete something to make room.
         </div>
       )}
-      <Editor
-        text={session.text}
-        awareness={session.provider.awareness}
-        language={language}
-        readOnly={connection.blocked !== null}
-        onSizeLimit={flagSizeLimit}
-      />
+      {decisionError && (
+        <div className="banner banner-error" role="alert">
+          {decisionError}
+        </div>
+      )}
+      <div className="pad-body">
+        <Editor
+          ref={editor}
+          text={session.text}
+          awareness={session.provider.awareness}
+          language={language}
+          readOnly={connection.blocked !== null}
+          onSizeLimit={flagSizeLimit}
+          suggestions={openSuggestions}
+          diffHandlers={diffHandlers}
+          onSelectionChange={setSelection}
+        />
+        {aiOpen && (
+          <AiPanel
+            roomId={roomId}
+            text={session.text}
+            info={aiInfo}
+            onInfoChange={refreshAi}
+            suggestions={suggestions}
+            selection={selection}
+            author={me}
+            connected={connected}
+            onClose={() => setAiOpen(false)}
+            onFocusSuggestion={(suggestion) => editor.current?.reveal(suggestion)}
+          />
+        )}
+      </div>
     </div>
   )
 }
@@ -92,6 +154,29 @@ function StoppedBanner({ reason }: { reason: Exclude<Blocked, 'room-full'> }) {
       </button>
     </div>
   )
+}
+
+/** A per-viewer on/off setting remembered in this browser. */
+function useRememberedFlag(key: string): [boolean, (value: boolean) => void] {
+  const [value, setValue] = useState(() => {
+    try {
+      return window.localStorage.getItem(key) === '1'
+    } catch {
+      return false
+    }
+  })
+  const update = useCallback(
+    (next: boolean) => {
+      setValue(next)
+      try {
+        window.localStorage.setItem(key, next ? '1' : '0')
+      } catch {
+        // Not remembering a panel's state is fine.
+      }
+    },
+    [key],
+  )
+  return [value, update]
 }
 
 /** A flag that turns itself off again after `durationMs`. */

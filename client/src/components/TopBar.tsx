@@ -3,6 +3,7 @@ import { LANGUAGES, type LanguageId } from '../lib/languages'
 import type { ConnectionStatus } from '../lib/useConnection'
 import type { Presence } from '../lib/usePresence'
 import { onLinkClick } from '../router'
+import { AiMark } from './AiPanel'
 import { PresenceMenu } from './PresenceMenu'
 import { StatusBadge } from './StatusBadge'
 
@@ -15,6 +16,10 @@ interface TopBarProps {
   unsynced: boolean
   /** The server refused this session for good; the badge would only mislead. */
   stopped: boolean
+  aiOpen: boolean
+  onToggleAi: () => void
+  /** Suggestions waiting for a decision. */
+  openSuggestions: number
 }
 
 export function TopBar({
@@ -25,6 +30,9 @@ export function TopBar({
   status,
   unsynced,
   stopped,
+  aiOpen,
+  onToggleAi,
+  openSuggestions,
 }: TopBarProps) {
   return (
     <header className="topbar">
@@ -38,6 +46,20 @@ export function TopBar({
       <div className="topbar-spacer" />
       {!stopped && <StatusBadge status={status} unsynced={unsynced} />}
       <PresenceMenu {...presence} />
+      <button
+        className={`button button-ai-toggle${aiOpen ? ' is-active' : ''}`}
+        type="button"
+        aria-pressed={aiOpen}
+        onClick={onToggleAi}
+      >
+        <AiMark />
+        Ask AI
+        {openSuggestions > 0 && (
+          <span className="ai-count" aria-label={`${openSuggestions} open suggestions`}>
+            {openSuggestions}
+          </span>
+        )}
+      </button>
       <label className="language-picker">
         <span className="visually-hidden">Language</span>
         <select

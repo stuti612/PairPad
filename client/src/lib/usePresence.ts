@@ -20,6 +20,8 @@ export interface Peer {
   color: string
   colorPicked: boolean
   isSelf: boolean
+  /** PairPad AI, which joins while it works on a request. */
+  isAi: boolean
 }
 
 export interface Presence {
@@ -40,6 +42,7 @@ function readPeers(awareness: Awareness): Peer[] {
       name: cleanName(user.name) ?? FALLBACK_NAME,
       color: cleanColor(user.color) ?? FALLBACK_COLOR,
       colorPicked: user.colorPicked === true,
+      isAi: user.ai === true,
       isSelf: clientId === awareness.clientID,
     })
   }
