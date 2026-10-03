@@ -2,6 +2,8 @@ import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { WebSocket, WebSocketServer } from 'ws'
 import { generateRoomId, isValidRoomId } from './ids.js'
+import { AiError } from './ai/llm.js'
+import type { AiService } from './ai/service.js'
 import { Metrics } from './metrics.js'
 import {
   CLOSE_LOAD_FAILED,
@@ -38,6 +40,8 @@ export interface PairPadServerOptions {
   retryMs?: number
   /** How long an empty room stays in memory before it is saved and unloaded. */
   idleUnloadMs?: number
+  /** The AI collaborator, or null/omitted when no provider is configured. */
+  ai?: AiService | null
   /** People allowed in one room at a time. */
   maxUsersPerRoom?: number
   /** Largest allowed document, measured as its encoded Yjs state in bytes. */
@@ -68,6 +72,7 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
     roomTtlMs = 7 * DAY_MS,
     cleanupIntervalMs = 60 * 60 * 1000,
     onError = (error, context) => console.error(`Error ${context}:`, error),
+    ai = null,
     maxUsersPerRoom = DEFAULT_MAX_USERS_PER_ROOM,
     maxDocBytes = DEFAULT_MAX_DOC_BYTES,
     now = Date.now,
@@ -123,12 +128,63 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
         limits: { maxUsersPerRoom, maxDocBytes },
       })
     }
+    const aiRoute = AI_ROUTE.exec(pathname)
+    if (aiRoute) return handleAi(req, res, aiRoute[1]!)
+
     const isPage = req.method === 'GET' || req.method === 'HEAD'
     const reserved = pathname.startsWith('/api/') || pathname.startsWith(WS_PATH_PREFIX)
     if (staticDir && isPage && !reserved && (await serveStatic(staticDir, pathname, req, res))) {
       return
     }
     sendJson(res, 404, { error: 'not found' })
+  }
+
+  // GET: whether the AI is available here, and how many requests are left.
+  // POST: ask it for a suggestion. Keys and provider details never leave the server.
+  async function handleAi(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    roomId: string,
+  ): Promise<void> {
+    if (!isValidRoomId(roomId)) return sendJson(res, 404, { error: 'not found' })
+    if (req.method === 'GET') {
+      if (!ai) return sendJson(res, 200, { enabled: false })
+      return sendJson(res, 200, {
+        enabled: true,
+        provider: ai.label,
+        busy: ai.isBusy(roomId),
+        quota: ai.quotaFor(roomId),
+      })
+    }
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
+    if (!ai) return sendJson(res, 503, { error: 'The AI collaborator is not set up on this server.' })
+
+    const room = rooms.get(roomId)
+    if (!room) return sendJson(res, 409, { error: 'Open the pad before asking the AI.' })
+
+    let body: unknown
+    try {
+      body = await readJson(req, MAX_AI_BODY_BYTES)
+    } catch (error) {
+      const status = error instanceof BodyTooLargeError ? 413 : 400
+      return sendJson(res, status, {
+        error: status === 413 ? 'The request is too large.' : 'The request was not valid JSON.',
+      })
+    }
+
+    // Everyone may leave while the AI works; the room must outlive the request.
+    const release = rooms.hold(room)
+    try {
+      const proposal = await ai.propose(room, body)
+      sendJson(res, 200, { proposal, quota: ai.quotaFor(roomId) })
+    } catch (error) {
+      const failure =
+        error instanceof AiError ? error : new AiError('The AI request failed unexpectedly.', 'unavailable')
+      if (!(error instanceof AiError)) onError(error, `AI request in room ${roomId}`)
+      sendJson(res, failure.status, { error: failure.message, quota: ai.quotaFor(roomId) })
+    } finally {
+      release()
+    }
   }
 
   httpServer.on('upgrade', (req, socket, head) => {
@@ -261,6 +317,40 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
       await storage.close()
     },
   }
+}
+
+const AI_ROUTE = /^\/api\/rooms\/([^/]+)\/ai$/
+const MAX_AI_BODY_BYTES = 16 * 1024
+
+class BodyTooLargeError extends Error {}
+
+function readJson(req: http.IncomingMessage, limitBytes: number): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    let tooLarge = false
+    req.on('data', (chunk: Buffer) => {
+      if (tooLarge) return
+      size += chunk.length
+      if (size > limitBytes) {
+        // Keep reading and discarding the rest, so the 413 can still be sent.
+        tooLarge = true
+        chunks.length = 0
+        reject(new BodyTooLargeError())
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      if (tooLarge) return
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null'))
+      } catch (error) {
+        reject(error)
+      }
+    })
+    req.on('error', reject)
+  })
 }
 
 function roomIdFromUrl(url: string | undefined): string | null {

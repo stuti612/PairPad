@@ -34,6 +34,8 @@ export class Room {
   // Each connection maps to the awareness client IDs it announced, so their
   // presence can be cleared when the socket goes away.
   private readonly conns = new Map<WebSocket, Set<number>>()
+  /** Server-side work (such as an AI request) keeping the room in memory. */
+  holds = 0
   // Upper estimate of the encoded document size, so the exact (and slower)
   // measurement only happens when a room is actually close to the limit.
   private sizeEstimate = 0
@@ -272,12 +274,29 @@ export class RoomManager {
   /** Call after a connection leaves; an empty room is unloaded after a grace period. */
   release(room: Room): void {
     const entry = this.entries.get(room.id)
-    if (!entry || entry.room !== room || room.size > 0 || entry.idleTimer) return
+    if (!entry || entry.room !== room || !isIdle(room) || entry.idleTimer) return
     entry.idleTimer = setTimeout(() => {
       entry.idleTimer = null
-      if (room.size === 0) void this.unload(room.id)
+      if (isIdle(room)) void this.unload(room.id)
     }, this.options.idleUnloadMs)
     entry.idleTimer.unref()
+  }
+
+  /**
+   * Keeps a loaded room in memory while server-side work runs, even if
+   * everyone leaves. Call the returned function when the work is done.
+   */
+  hold(room: Room): () => void {
+    room.holds++
+    const entry = this.entries.get(room.id)
+    if (entry) this.cancelIdle(entry)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      room.holds--
+      this.release(room)
+    }
   }
 
   /** Writes any buffered edits for every room in memory. */
@@ -356,4 +375,8 @@ export class RoomManager {
     if (entry.idleTimer) clearTimeout(entry.idleTimer)
     entry.idleTimer = null
   }
+}
+
+function isIdle(room: Room): boolean {
+  return room.size === 0 && room.holds === 0
 }

@@ -73,6 +73,35 @@ That one property gives several things for free:
 
 The costs are real but small here: a Yjs document carries some bookkeeping beyond the text, and deleted characters leave small markers behind. That is why the size limit below is measured on the stored document, not the visible text.
 
+## AI collaborator: free setup
+
+PairPad includes an AI pair programmer, "PairPad AI", that joins a pad as a participant. It runs only on free tiers that need no credit card, and the server keeps every API key; browsers never see one.
+
+**Without a key**, the app works as normal and the AI panel says the AI isn't set up.
+
+**To turn it on for free:**
+
+1. Create a free Groq API key at [console.groq.com/keys](https://console.groq.com/keys).
+2. Optionally, create a GitHub personal access token with the **Models: read** permission at [github.com/settings/personal-access-tokens](https://github.com/settings/personal-access-tokens/new). It is used when Groq is rate limited.
+3. Copy `.env.example` to `.env` and paste in the key (and token), or set them as environment variables (on Replit or Render, as secrets).
+4. Restart the server. The startup log shows which providers and models are in use, for example `AI: Groq (openai/gpt-oss-120b, judged by openai/gpt-oss-20b), falling back to GitHub Models (...)`.
+
+| Provider | Role | Default models (write / judge) | Free allowance | Key |
+| --- | --- | --- | --- | --- |
+| [Groq](https://console.groq.com) | Primary | `openai/gpt-oss-120b` / `openai/gpt-oss-20b` | 30 requests/min, 1,000/day, 8K tokens/min per model | `GROQ_API_KEY` |
+| [GitHub Models](https://github.com/marketplace/models) | Fallback | `openai/gpt-4.1` / `openai/gpt-4.1-mini` | Depends on your GitHub plan; about 50 to 150 requests/day on the free plan | `GITHUB_TOKEN` |
+| [OpenRouter](https://openrouter.ai) | Optional | free `:free` models only | 20 requests/min, 50/day without credits | `OPENROUTER_API_KEY` |
+| Any OpenAI-compatible API | Optional | your choice | | `CUSTOM_*` |
+
+Free catalogs change often. Check the models in your provider's dashboard and override them with `<PROVIDER>_MODEL` and `<PROVIDER>_JUDGE_MODEL` (see `.env.example`). Cerebras is supported too (`AI_PROVIDER=cerebras`), but since 2026 its free credits require a payment method on file, so it is not a default.
+
+**How the free allowance is protected:**
+
+- **Caps**: each pad may make 10 AI requests per hour and the whole server 100 per day (`AI_ROOM_HOURLY_LIMIT`, `AI_DAILY_LIMIT`). The AI panel shows what is left. One request makes at most four model calls, so 100 requests stay well inside Groq's 1,000 calls per day per model. The counts are kept in memory and reset when the server restarts.
+- **Fallback**: if a provider answers with a rate-limit or quota error (or is down, too slow, or rejects the key), the request is tried once on the fallback provider. If that fails too, the person sees "AI is busy, try again in a minute" and nothing crashes.
+- **Size**: at most 8,000 characters of selected code per request, with up to 12,000 characters of surrounding code for context. Larger pads are trimmed around the selection, and the model is told where lines were left out.
+- **One at a time**: each pad runs one AI request at a time.
+
 ## Running locally
 
 Requires Node.js 22.5 or newer.
@@ -156,6 +185,7 @@ All settings are environment variables, and all are optional for local developme
 | `HOST` | `0.0.0.0` | Address the server binds to. |
 | `DATABASE_URL` | not set | Postgres connection string. When set, Postgres is used. |
 | `SQLITE_PATH` | `server/data/pairpad.sqlite` | SQLite file, used when `DATABASE_URL` is not set. `:memory:` for a throwaway database. |
+| `GROQ_API_KEY`, `GITHUB_TOKEN`, ... | not set | AI provider keys. See "AI collaborator: free setup" and `.env.example`. |
 | `REQUIRE_POSTGRES` | not set | Set to `1` to refuse to start without `DATABASE_URL`. Automatic on Replit deployments. |
 | `STATIC_DIR` | `client/dist` | Built frontend to serve. |
 | `MAX_USERS_PER_ROOM` | `10` | People allowed in one pad at a time. |

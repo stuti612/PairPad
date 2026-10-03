@@ -1,0 +1,197 @@
+import * as Y from 'yjs'
+import { TEXT_KEY } from '../protocol.js'
+import type { Room } from '../room.js'
+import { AiError, type LlmClient } from './llm.js'
+import { AiPresence } from './presence.js'
+import { GENERATION_SYSTEM, generationPrompt, SuggestionSchema } from './prompts.js'
+import { AiQuota, type QuotaLimits, type QuotaStatus } from './quota.js'
+
+// Free tiers allow only a few thousand tokens per minute, so what is sent to
+// the model is bounded: the selection itself, plus surrounding code.
+export const MAX_INSTRUCTION_CHARS = 1_000
+export const MAX_TARGET_CHARS = 8_000
+const MAX_CONTEXT_CHARS = 12_000
+const MAX_AUTHOR_CHARS = 40
+const GENERATION_MAX_TOKENS = 4_096
+
+export interface AiServiceOptions {
+  llm: LlmClient
+  quota: QuotaLimits
+  /** Longest a whole AI request may take, all model calls included. */
+  timeoutMs: number
+  now?: () => number
+}
+
+export interface AiRequestInput {
+  instruction: string
+  /** The requester's selection as Yjs relative positions, or null for the whole pad. */
+  selection: { anchor: unknown; head: unknown } | null
+  author: string
+}
+
+export interface Proposal {
+  from: number
+  to: number
+  originalText: string
+  proposedText: string
+  summary: string
+  language: string
+}
+
+export class AiService {
+  readonly quota: AiQuota
+  private readonly busyRooms = new Set<string>()
+
+  constructor(private readonly options: AiServiceOptions) {
+    this.quota = new AiQuota(options.quota, options.now)
+  }
+
+  get label(): string {
+    return this.options.llm.label
+  }
+
+  quotaFor(roomId: string): QuotaStatus {
+    return this.quota.status(roomId)
+  }
+
+  isBusy(roomId: string): boolean {
+    return this.busyRooms.has(roomId)
+  }
+
+  /** Asks the model for a change to the selected code. The room must be loaded. */
+  async propose(room: Room, input: unknown): Promise<Proposal> {
+    const request = parseRequest(input)
+    if (this.busyRooms.has(room.id)) {
+      throw new AiError(
+        'PairPad AI is already working on a request in this pad. Wait for it to finish.',
+        'limited',
+      )
+    }
+    const text = room.doc.getText(TEXT_KEY)
+    const { from, to } = resolveRange(room.doc, text, request.selection)
+    const content = text.toString()
+    const originalText = content.slice(from, to)
+    if (originalText.length > MAX_TARGET_CHARS) {
+      throw new AiError(
+        `Select less code: the AI works on up to ${MAX_TARGET_CHARS.toLocaleString('en')} characters at a time.`,
+        'invalid',
+      )
+    }
+    const language = String(room.doc.getMap('meta').get('language') ?? 'javascript')
+    // Counted only once the request is known to be valid.
+    const refusal = this.quota.take(room.id)
+    if (refusal) throw new AiError(refusal, 'limited')
+
+    this.busyRooms.add(room.id)
+    const presence = new AiPresence(room)
+    const abort = new AbortController()
+    const timer = setTimeout(() => abort.abort(), this.options.timeoutMs)
+    try {
+      presence.show(text, from, to, 'Writing a suggestion')
+      const result = await this.options.llm.complete({
+        role: 'generate',
+        system: GENERATION_SYSTEM,
+        prompt: generationPrompt({
+          language,
+          instruction: request.instruction,
+          ...surroundings(content, from, to),
+        }),
+        schema: SuggestionSchema,
+        schemaName: 'suggestion',
+        maxTokens: GENERATION_MAX_TOKENS,
+        timeoutMs: this.options.timeoutMs,
+        signal: abort.signal,
+      })
+      return {
+        from,
+        to,
+        originalText,
+        proposedText: result.replacement,
+        summary: result.summary,
+        language,
+      }
+    } catch (error) {
+      if (abort.signal.aborted) {
+        throw new AiError('The AI took too long and the request was stopped. Try again.', 'timeout')
+      }
+      throw error
+    } finally {
+      clearTimeout(timer)
+      presence.leave()
+      this.busyRooms.delete(room.id)
+    }
+  }
+}
+
+function parseRequest(input: unknown): AiRequestInput {
+  const body = (input ?? {}) as Record<string, unknown>
+  const instruction = typeof body.instruction === 'string' ? body.instruction.trim() : ''
+  if (!instruction) throw new AiError('Type an instruction for the AI.', 'invalid')
+  if (instruction.length > MAX_INSTRUCTION_CHARS) {
+    throw new AiError(
+      `Keep the instruction under ${MAX_INSTRUCTION_CHARS.toLocaleString('en')} characters.`,
+      'invalid',
+    )
+  }
+  const author =
+    typeof body.author === 'string' && body.author.trim()
+      ? body.author.trim().slice(0, MAX_AUTHOR_CHARS)
+      : 'Someone'
+  const selection = body.selection as AiRequestInput['selection'] | undefined
+  if (selection != null && (typeof selection !== 'object' || !('anchor' in selection) || !('head' in selection))) {
+    throw new AiError('The selection was not understood.', 'invalid')
+  }
+  return { instruction, author, selection: selection ?? null }
+}
+
+function resolveRange(
+  doc: Y.Doc,
+  text: Y.Text,
+  selection: AiRequestInput['selection'],
+): { from: number; to: number } {
+  if (!selection) return { from: 0, to: text.length }
+  const anchor = toIndex(doc, text, selection.anchor)
+  const head = toIndex(doc, text, selection.head)
+  if (anchor === null || head === null) {
+    throw new AiError('The selected code has changed. Select it again.', 'invalid')
+  }
+  return { from: Math.min(anchor, head), to: Math.max(anchor, head) }
+}
+
+function toIndex(doc: Y.Doc, text: Y.Text, relative: unknown): number | null {
+  try {
+    const position = Y.createAbsolutePositionFromRelativePosition(
+      Y.createRelativePositionFromJSON(relative),
+      doc,
+    )
+    return position && position.type === text ? position.index : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The code around the target, shortened at line boundaries when the pad is
+ * large. The model is told where lines were left out.
+ */
+function surroundings(content: string, from: number, to: number) {
+  let before = content.slice(0, from)
+  let after = content.slice(to)
+  const budget = MAX_CONTEXT_CHARS
+  if (before.length + after.length > budget) {
+    const half = Math.floor(budget / 2)
+    const keepBefore = Math.min(before.length, Math.max(half, budget - after.length))
+    const keepAfter = Math.min(after.length, budget - keepBefore)
+    if (keepBefore < before.length) {
+      const cut = before.indexOf('\n', before.length - keepBefore)
+      const omitted = before.slice(0, cut + 1).split('\n').length - 1
+      before = `[${omitted} earlier lines not shown]\n${before.slice(cut + 1)}`
+    }
+    if (keepAfter < after.length) {
+      const cut = after.lastIndexOf('\n', keepAfter)
+      const omitted = after.slice(cut).split('\n').length - 1
+      after = `${after.slice(0, cut + 1)}[${omitted} later lines not shown]`
+    }
+  }
+  return { before, target: content.slice(from, to), after }
+}
