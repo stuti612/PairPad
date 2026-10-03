@@ -235,6 +235,8 @@ export interface RoomManagerOptions extends PersistenceOptions {
   idleUnloadMs: number
   /** Largest allowed encoded document, in bytes. */
   maxDocBytes: number
+  /** Runs once each time a room is loaded into memory, before anyone joins. */
+  onRoomLoaded?: (room: Room) => void
 }
 
 /**
@@ -350,6 +352,7 @@ export class RoomManager {
     // Attached after loading so stored updates are not written back again.
     const persistence = new RoomPersistence(id, room.doc, storage, updates.length, this.options)
     this.entries.set(id, { room, persistence, idleTimer: null })
+    this.options.onRoomLoaded?.(room)
     if (updates.length > 0) {
       storage.touch(id, now()).catch((error) => onError(error, `touching room ${id}`))
     }

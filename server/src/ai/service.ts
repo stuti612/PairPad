@@ -5,6 +5,7 @@ import { AiError, type LlmClient } from './llm.js'
 import { AiPresence } from './presence.js'
 import { GENERATION_SYSTEM, generationPrompt, SuggestionSchema } from './prompts.js'
 import { AiQuota, type QuotaLimits, type QuotaStatus } from './quota.js'
+import { SuggestionStore, type Suggestion } from './suggestions.js'
 
 // Free tiers allow only a few thousand tokens per minute, so what is sent to
 // the model is bounded: the selection itself, plus surrounding code.
@@ -29,18 +30,14 @@ export interface AiRequestInput {
   author: string
 }
 
-export interface Proposal {
-  from: number
-  to: number
-  originalText: string
-  proposedText: string
-  summary: string
-  language: string
-}
-
 export class AiService {
   readonly quota: AiQuota
   private readonly busyRooms = new Set<string>()
+  private readonly stores = new WeakMap<Room, SuggestionStore>()
+  /** Work started by start(), so tests and shutdown can wait for it. */
+  private readonly running = new Set<Promise<void>>()
+  private readonly aborts = new Set<AbortController>()
+  private shuttingDown = false
 
   constructor(private readonly options: AiServiceOptions) {
     this.quota = new AiQuota(options.quota, options.now)
@@ -58,8 +55,47 @@ export class AiService {
     return this.busyRooms.has(roomId)
   }
 
-  /** Asks the model for a change to the selected code. The room must be loaded. */
-  async propose(room: Room, input: unknown): Promise<Proposal> {
+  /**
+   * Called when a room loads, so its suggestions are guarded from the start
+   * (see SuggestionStore).
+   */
+  attach(room: Room): SuggestionStore {
+    let store = this.stores.get(room)
+    if (!store) {
+      store = new SuggestionStore(room.doc, this.options.now)
+      this.stores.set(room, store)
+    }
+    return store
+  }
+
+  /** Accepts a pending suggestion, applying it to the pad exactly once. */
+  accept(room: Room, id: string, by: string): Suggestion {
+    return this.attach(room).accept(id, cleanAuthor(by))
+  }
+
+  reject(room: Room, id: string, by: string): Suggestion {
+    return this.attach(room).reject(id, cleanAuthor(by))
+  }
+
+  /** Stops every running request (as failed) and waits for them, before shutdown. */
+  async shutdown(): Promise<void> {
+    this.shuttingDown = true
+    for (const abort of this.aborts) abort.abort()
+    await this.idle()
+  }
+
+  /** Resolves once every request started so far has finished. */
+  async idle(): Promise<void> {
+    while (this.running.size > 0) await Promise.allSettled([...this.running])
+  }
+
+  /**
+   * Starts an AI request and returns the new suggestion straight away, with
+   * status "working". The result arrives in the shared map for everyone.
+   * Problems found before starting (bad input, caps) are thrown instead.
+   * `onSettled` runs when the work is over, whatever the outcome.
+   */
+  start(room: Room, input: unknown, onSettled: () => void = () => {}): Suggestion {
     const request = parseRequest(input)
     if (this.busyRooms.has(room.id)) {
       throw new AiError(
@@ -69,9 +105,7 @@ export class AiService {
     }
     const text = room.doc.getText(TEXT_KEY)
     const { from, to } = resolveRange(room.doc, text, request.selection)
-    const content = text.toString()
-    const originalText = content.slice(from, to)
-    if (originalText.length > MAX_TARGET_CHARS) {
+    if (to - from > MAX_TARGET_CHARS) {
       throw new AiError(
         `Select less code: the AI works on up to ${MAX_TARGET_CHARS.toLocaleString('en')} characters at a time.`,
         'invalid',
@@ -82,9 +116,49 @@ export class AiService {
     const refusal = this.quota.take(room.id)
     if (refusal) throw new AiError(refusal, 'limited')
 
+    const store = this.attach(room)
+    const suggestion = store.create({
+      author: request.author,
+      instruction: request.instruction,
+      language,
+      from,
+      to,
+    })
     this.busyRooms.add(room.id)
+    const work = this.run(room, store, suggestion, { from, to })
+      .catch((error) => {
+        // run() records its own failures; this only guards against a bug there.
+        console.error('Unexpected error in AI request:', error)
+        try {
+          store.update(suggestion.id, {
+            status: 'failed',
+            phase: null,
+            failureReasons: ['The AI request failed unexpectedly.'],
+          })
+        } catch {
+          // The room may already be gone; there is nobody left to tell.
+        }
+      })
+      .finally(() => {
+        this.busyRooms.delete(room.id)
+        this.running.delete(work)
+        onSettled()
+      })
+    this.running.add(work)
+    return suggestion
+  }
+
+  private async run(
+    room: Room,
+    store: SuggestionStore,
+    suggestion: Suggestion,
+    { from, to }: { from: number; to: number },
+  ): Promise<void> {
+    const text = room.doc.getText(TEXT_KEY)
+    const content = text.toString()
     const presence = new AiPresence(room)
     const abort = new AbortController()
+    this.aborts.add(abort)
     const timer = setTimeout(() => abort.abort(), this.options.timeoutMs)
     try {
       presence.show(text, from, to, 'Writing a suggestion')
@@ -92,8 +166,8 @@ export class AiService {
         role: 'generate',
         system: GENERATION_SYSTEM,
         prompt: generationPrompt({
-          language,
-          instruction: request.instruction,
+          language: suggestion.language,
+          instruction: suggestion.instruction,
           ...surroundings(content, from, to),
         }),
         schema: SuggestionSchema,
@@ -102,24 +176,36 @@ export class AiService {
         timeoutMs: this.options.timeoutMs,
         signal: abort.signal,
       })
-      return {
-        from,
-        to,
-        originalText,
+      store.update(suggestion.id, {
+        status: 'pending',
+        phase: null,
         proposedText: result.replacement,
         summary: result.summary,
-        language,
-      }
+        updatedAt: this.now(),
+      })
     } catch (error) {
-      if (abort.signal.aborted) {
-        throw new AiError('The AI took too long and the request was stopped. Try again.', 'timeout')
-      }
-      throw error
+      const message = this.shuttingDown
+        ? 'The server restarted while the AI was working. Ask again.'
+        : abort.signal.aborted
+        ? 'The AI took too long and the request was stopped. Try again.'
+        : error instanceof AiError
+          ? error.message
+          : 'The AI request failed unexpectedly.'
+      store.update(suggestion.id, {
+        status: 'failed',
+        phase: null,
+        failureReasons: [message],
+        updatedAt: this.now(),
+      })
     } finally {
       clearTimeout(timer)
+      this.aborts.delete(abort)
       presence.leave()
-      this.busyRooms.delete(room.id)
     }
+  }
+
+  private now(): number {
+    return (this.options.now ?? Date.now)()
   }
 }
 
@@ -133,15 +219,18 @@ function parseRequest(input: unknown): AiRequestInput {
       'invalid',
     )
   }
-  const author =
-    typeof body.author === 'string' && body.author.trim()
-      ? body.author.trim().slice(0, MAX_AUTHOR_CHARS)
-      : 'Someone'
+  const author = cleanAuthor(body.author)
   const selection = body.selection as AiRequestInput['selection'] | undefined
   if (selection != null && (typeof selection !== 'object' || !('anchor' in selection) || !('head' in selection))) {
     throw new AiError('The selection was not understood.', 'invalid')
   }
   return { instruction, author, selection: selection ?? null }
+}
+
+function cleanAuthor(value: unknown): string {
+  return typeof value === 'string' && value.trim()
+    ? value.trim().replace(/\s+/g, ' ').slice(0, MAX_AUTHOR_CHARS)
+    : 'Someone'
 }
 
 function resolveRange(

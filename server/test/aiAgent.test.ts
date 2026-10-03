@@ -1,16 +1,18 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import * as Y from 'yjs'
-import { BUSY_MESSAGE, AiError } from '../src/ai/llm.js'
+import { AiError, BUSY_MESSAGE } from '../src/ai/llm.js'
 import { AI_COLOR, AI_NAME } from '../src/ai/presence.js'
 import { AiService } from '../src/ai/service.js'
+import type { Suggestion } from '../src/ai/suggestions.js'
 import type { PairPadServerOptions } from '../src/server.js'
 import { deferred, ScriptedLlm } from './aiHelpers.js'
 import { startTestServer, TestClient, waitFor, type TestServer } from './helpers.js'
 
-const ROOM = 'airoom01'
+export const ROOM = 'airoom01'
 const CODE = 'function add(a, b) {\n  return a + b\n}\n'
 
 let ts: TestServer
+let ai: AiService
 let clients: TestClient[] = []
 
 afterEach(async () => {
@@ -19,8 +21,12 @@ afterEach(async () => {
   await ts.server.close()
 })
 
-async function start(llm: ScriptedLlm, options: PairPadServerOptions = {}, quota = { perRoomPerHour: 10, perDay: 100 }) {
-  const ai = new AiService({ llm, quota, timeoutMs: 5_000 })
+async function start(
+  llm: ScriptedLlm,
+  options: PairPadServerOptions = {},
+  quota = { perRoomPerHour: 10, perDay: 100 },
+) {
+  ai = new AiService({ llm, quota, timeoutMs: 5_000 })
   ts = await startTestServer({ ai, ...options })
   return ai
 }
@@ -30,10 +36,12 @@ async function connectWithCode(code = CODE): Promise<TestClient> {
   clients.push(client)
   if (code) {
     client.text.insert(0, code)
-    await waitFor(() => ts.server.rooms.get(ROOM)?.doc.getText('content').toString() === code)
+    await waitFor(() => serverText() === code)
   }
   return client
 }
+
+const serverText = () => ts.server.rooms.get(ROOM)?.doc.getText('content').toString()
 
 /** The selection a browser would send: Yjs relative positions, as JSON. */
 function selectionOf(client: TestClient, from: number, to: number) {
@@ -51,52 +59,96 @@ function ask(body: unknown, roomId = ROOM) {
   })
 }
 
+function decide(id: string, action: 'accept' | 'reject', by = 'Alice') {
+  return fetch(`${ts.httpUrl}/api/rooms/${ROOM}/suggestions/${id}/${action}`, {
+    method: 'POST',
+    body: JSON.stringify({ by }),
+  })
+}
+
+/** A client's view of one suggestion in the shared map. */
+const seen = (client: TestClient, id: string) =>
+  client.doc.getMap<Suggestion>('suggestions').get(id)
+
+/** Asks, then waits until the client sees the suggestion leave "working". */
+async function askAndSettle(client: TestClient, body: unknown): Promise<Suggestion> {
+  const res = await ask(body)
+  expect(res.status).toBe(202)
+  const { id } = (await res.json()) as { id: string }
+  await waitFor(() => !!seen(client, id) && seen(client, id)!.status !== 'working')
+  return seen(client, id)!
+}
+
 const aiPeer = (client: TestClient) =>
   [...client.peers.values()].find((state) => (state.user as { name?: string })?.name === AI_NAME)
 
+const proposal = (replacement: string, summary = 'A change.') => ({ replacement, summary })
+
 describe('asking the AI for a change', () => {
-  it('sends the selected code and instruction to the model and returns its proposal', async () => {
-    const llm = new ScriptedLlm().reply('generate', {
-      replacement: 'function add(a, b) {\n  if (typeof a !== "number") throw new TypeError("a")\n  return a + b\n}',
-      summary: 'Checks that a is a number.',
+  it('sends the selected code and instruction to the model, and shares the suggestion with everyone', async () => {
+    const gate = deferred()
+    const llm = new ScriptedLlm().reply('generate', async () => {
+      await gate.promise
+      return proposal(
+        'function add(a, b) {\n  if (typeof a !== "number") throw new TypeError("a")\n  return a + b\n}',
+        'Checks a.',
+      )
     })
     await start(llm)
     const alice = await connectWithCode()
+    const bob = await connectWithCode('')
 
     const res = await ask({
       instruction: 'add input validation',
       selection: selectionOf(alice, 0, CODE.length - 1),
       author: 'Alice',
     })
-    expect(res.status).toBe(200)
-    const { proposal, quota } = (await res.json()) as Record<string, any>
-    expect(proposal).toMatchObject({
-      from: 0,
-      to: CODE.length - 1,
-      originalText: CODE.slice(0, -1),
-      summary: 'Checks that a is a number.',
-      language: 'javascript',
-    })
-    expect(proposal.proposedText).toContain('TypeError')
+    expect(res.status).toBe(202)
+    const { id, quota } = (await res.json()) as { id: string; quota: any }
     expect(quota.room).toMatchObject({ limit: 10, remaining: 9 })
+
+    // Bob sees the request straight away, while the AI is still writing.
+    await waitFor(() => seen(bob, id) !== undefined)
+    expect(seen(bob, id)).toMatchObject({
+      status: 'working',
+      phase: 'Writing a suggestion',
+      author: 'Alice',
+      instruction: 'add input validation',
+    })
+    gate.resolve()
+
+    await waitFor(() => seen(bob, id)?.status === 'pending')
+    const suggestion = seen(bob, id)!
+    expect(suggestion).toMatchObject({
+      originalText: CODE.slice(0, -1),
+      summary: 'Checks a.',
+      language: 'javascript',
+      phase: null,
+    })
+    expect(suggestion.proposedText).toContain('TypeError')
+    // The anchored range resolves to the selected code in Bob's own copy.
+    const at = (relative: unknown) =>
+      Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(relative), bob.doc)?.index
+    expect([at(suggestion.range.start), at(suggestion.range.end)]).toEqual([0, CODE.length - 1])
 
     const sent = llm.requests[0]!
     expect(sent.role).toBe('generate')
     expect(sent.prompt).toContain('Instruction: add input validation')
     expect(sent.prompt).toContain('<target_region>\nfunction add(a, b) {')
     expect(sent.prompt).toContain('Language: JavaScript')
+    // Asking does not touch the code itself.
+    expect(serverText()).toBe(CODE)
   })
 
-  it('works on the whole pad when nothing is selected, using the pad\'s language', async () => {
-    const llm = new ScriptedLlm().reply('generate', { replacement: 'print("hi")', summary: 's' })
+  it("works on the whole pad when nothing is selected, using the pad's language", async () => {
+    const llm = new ScriptedLlm().reply('generate', proposal('print("hi")'))
     await start(llm)
     const alice = await connectWithCode('print("hello")')
     alice.doc.getMap('meta').set('language', 'python')
     await waitFor(() => ts.server.rooms.get(ROOM)?.doc.getMap('meta').get('language') === 'python')
 
-    const res = await ask({ instruction: 'say hi', selection: null })
-    const { proposal } = (await res.json()) as Record<string, any>
-    expect(proposal).toMatchObject({ from: 0, to: 14, originalText: 'print("hello")', language: 'python' })
+    const suggestion = await askAndSettle(alice, { instruction: 'say hi', selection: null })
+    expect(suggestion).toMatchObject({ originalText: 'print("hello")', language: 'python', status: 'pending' })
     expect(llm.requests[0]!.prompt).toContain('Language: Python')
   })
 
@@ -104,13 +156,13 @@ describe('asking the AI for a change', () => {
     const gate = deferred()
     const llm = new ScriptedLlm().reply('generate', async () => {
       await gate.promise
-      return { replacement: 'x', summary: 's' }
+      return proposal('x')
     })
     await start(llm)
     const alice = await connectWithCode()
     const bob = await connectWithCode('')
 
-    const pending = ask({ instruction: 'rename', selection: selectionOf(alice, 9, 12) })
+    await ask({ instruction: 'rename', selection: selectionOf(alice, 9, 12) })
     await waitFor(() => aiPeer(bob) !== undefined)
 
     const state = aiPeer(bob)!
@@ -123,7 +175,6 @@ describe('asking the AI for a change', () => {
     expect(ts.server.rooms.get(ROOM)?.size).toBe(2)
 
     gate.resolve()
-    expect((await pending).status).toBe(200)
     await waitFor(() => aiPeer(bob) === undefined && aiPeer(alice) === undefined)
   })
 
@@ -131,32 +182,27 @@ describe('asking the AI for a change', () => {
     const gate = deferred()
     const llm = new ScriptedLlm().reply('generate', async () => {
       await gate.promise
-      return { replacement: 'x', summary: 's' }
+      return proposal('x')
     })
-    const ai = await start(llm)
+    await start(llm)
     await connectWithCode()
 
-    const first = ask({ instruction: 'one' })
-    await waitFor(() => ai.isBusy(ROOM))
+    expect((await ask({ instruction: 'one' })).status).toBe(202)
     const second = await ask({ instruction: 'two' })
     expect(second.status).toBe(429)
     expect(((await second.json()) as { error: string }).error).toMatch(/already working/)
-
     gate.resolve()
-    expect((await first).status).toBe(200)
+    await ai.idle()
+    expect(ai.isBusy(ROOM)).toBe(false)
   })
 
   it('stops at the hourly cap and reports what is left', async () => {
-    const llm = new ScriptedLlm().reply(
-      'generate',
-      { replacement: 'a', summary: 's' },
-      { replacement: 'b', summary: 's' },
-    )
+    const llm = new ScriptedLlm().reply('generate', proposal('a'), proposal('b'))
     await start(llm, {}, { perRoomPerHour: 2, perDay: 100 })
-    await connectWithCode()
+    const alice = await connectWithCode()
 
-    expect((await ask({ instruction: 'one' })).status).toBe(200)
-    expect((await ask({ instruction: 'two' })).status).toBe(200)
+    await askAndSettle(alice, { instruction: 'one' })
+    await askAndSettle(alice, { instruction: 'two' })
     const third = await ask({ instruction: 'three' })
     expect(third.status).toBe(429)
     const body = (await third.json()) as Record<string, any>
@@ -187,30 +233,26 @@ describe('asking the AI for a change', () => {
     expect(((await res.json()) as { error: string }).error).toMatch(/Select less code/)
   })
 
-  it('passes on a friendly message when the providers are busy, and leaves the room', async () => {
+  it('shows a friendly message on the suggestion when the providers are busy', async () => {
     const llm = new ScriptedLlm().reply('generate', new AiError(BUSY_MESSAGE, 'busy'))
     await start(llm)
     const alice = await connectWithCode()
 
-    const res = await ask({ instruction: 'anything' })
-    expect(res.status).toBe(503)
-    expect(((await res.json()) as { error: string }).error).toBe(BUSY_MESSAGE)
+    const suggestion = await askAndSettle(alice, { instruction: 'anything' })
+    expect(suggestion).toMatchObject({ status: 'failed', failureReasons: [BUSY_MESSAGE] })
     await waitFor(() => aiPeer(alice) === undefined)
-    // The server carries on as normal.
+    // The pad carries on as normal.
     alice.text.insert(0, '// still here\n')
-    await waitFor(() => ts.server.rooms.get(ROOM)!.doc.getText('content').toString().startsWith('// still here'))
+    await waitFor(() => serverText()!.startsWith('// still here'))
   })
 
   it('never crashes on an unexpected error from the model layer', async () => {
     const llm = new ScriptedLlm().reply('generate', new TypeError('boom'))
-    const errors: string[] = []
-    await start(llm, { onError: (_error, context) => errors.push(context) })
-    await connectWithCode()
+    await start(llm)
+    const alice = await connectWithCode()
 
-    const res = await ask({ instruction: 'anything' })
-    expect(res.status).toBe(503)
-    expect(((await res.json()) as { error: string }).error).toBe('The AI request failed unexpectedly.')
-    expect(errors).toEqual([`AI request in room ${ROOM}`])
+    const suggestion = await askAndSettle(alice, { instruction: 'anything' })
+    expect(suggestion).toMatchObject({ status: 'failed', failureReasons: ['The AI request failed unexpectedly.'] })
     expect((await fetch(`${ts.httpUrl}/health`)).status).toBe(200)
   })
 
@@ -218,13 +260,13 @@ describe('asking the AI for a change', () => {
     const gate = deferred()
     const llm = new ScriptedLlm().reply('generate', async () => {
       await gate.promise
-      return { replacement: 'x', summary: 's' }
+      return proposal('x')
     })
     await start(llm, { idleUnloadMs: 0 })
     const alice = await connectWithCode()
     const room = ts.server.rooms.get(ROOM)
 
-    const pending = ask({ instruction: 'go' })
+    expect((await ask({ instruction: 'go' })).status).toBe(202)
     await waitFor(() => llm.requests.length === 1)
     alice.close()
     await waitFor(() => room!.size === 0)
@@ -232,7 +274,7 @@ describe('asking the AI for a change', () => {
     expect(ts.server.rooms.get(ROOM)).toBe(room)
 
     gate.resolve()
-    expect((await pending).status).toBe(200)
+    await ai.idle()
     await waitFor(() => ts.server.rooms.get(ROOM) === undefined)
   })
 
@@ -248,12 +290,129 @@ describe('asking the AI for a change', () => {
   })
 })
 
-describe('when no AI provider is configured', () => {
-  it('reports the AI as unavailable instead of failing', async () => {
-    ts = await startTestServer()
-    const info = await (await fetch(`${ts.httpUrl}/api/rooms/${ROOM}/ai`)).json()
-    expect(info).toEqual({ enabled: false })
-    const res = await fetch(`${ts.httpUrl}/api/rooms/${ROOM}/ai`, { method: 'POST', body: '{}' })
-    expect(res.status).toBe(503)
+describe('accepting and rejecting', () => {
+  const NEW_BODY = '  return Number(a) + Number(b)'
+
+  /** A pending suggestion replacing line 2 of CODE. */
+  async function pendingSuggestion() {
+    const llm = new ScriptedLlm().reply('generate', proposal(NEW_BODY, 'Coerces to numbers.'))
+    await start(llm)
+    const alice = await connectWithCode()
+    const bob = await connectWithCode('')
+    const lineStart = CODE.indexOf('  return')
+    const lineEnd = CODE.indexOf('\n', lineStart)
+    const suggestion = await askAndSettle(alice, {
+      instruction: 'coerce to numbers',
+      selection: selectionOf(alice, lineStart, lineEnd),
+    })
+    expect(suggestion.status).toBe('pending')
+    return { alice, bob, id: suggestion.id }
+  }
+
+  const ACCEPTED = CODE.replace('  return a + b', NEW_BODY)
+
+  it('applies the change and marks it accepted, for everyone, in one step', async () => {
+    const { alice, bob, id } = await pendingSuggestion()
+    const changes: Array<[string, string | undefined]> = []
+    // Each transaction Bob receives: the text and the status always move together.
+    bob.doc.on('afterTransaction', () => changes.push([bob.text.toString(), seen(bob, id)?.status]))
+
+    const res = await decide(id, 'accept', 'Bob')
+    expect(res.status).toBe(200)
+    await waitFor(() => bob.text.toString() === ACCEPTED && alice.text.toString() === ACCEPTED)
+    expect(seen(alice, id)).toMatchObject({ status: 'accepted', resolvedBy: 'Bob' })
+    expect(changes.filter(([text]) => text === ACCEPTED).every(([, status]) => status === 'accepted')).toBe(true)
+    expect(changes.filter(([text]) => text === CODE).every(([, status]) => status === 'pending')).toBe(true)
+  })
+
+  it('applies exactly once when several people click Accept at the same moment', async () => {
+    const { alice, bob, id } = await pendingSuggestion()
+
+    const responses = await Promise.all(Array.from({ length: 5 }, (_, i) => decide(id, 'accept', `Person ${i}`)))
+    const statuses = responses.map((res) => res.status).sort()
+    expect(statuses).toEqual([200, 409, 409, 409, 409])
+    const refusal = (await responses.find((res) => res.status === 409)!.json()) as { error: string }
+    expect(refusal.error).toBe('This suggestion was already accepted.')
+
+    await waitFor(() => alice.text.toString() === ACCEPTED && bob.text.toString() === ACCEPTED)
+    expect(serverText()).toBe(ACCEPTED)
+    expect(serverText()!.split('Number(a)').length - 1).toBe(1)
+  })
+
+  it('rejecting discards the suggestion and leaves the code alone', async () => {
+    const { alice, bob, id } = await pendingSuggestion()
+
+    expect((await decide(id, 'reject', 'Alice')).status).toBe(200)
+    await waitFor(() => seen(bob, id)?.status === 'rejected')
+    expect(seen(bob, id)!.resolvedBy).toBe('Alice')
+    expect(serverText()).toBe(CODE)
+    expect(alice.text.toString()).toBe(CODE)
+    expect(bob.text.toString()).toBe(CODE)
+
+    // Once decided, it stays decided.
+    expect((await decide(id, 'accept')).status).toBe(409)
+    expect((await decide(id, 'reject')).status).toBe(409)
+    expect(serverText()).toBe(CODE)
+  })
+
+  it('cannot be rejected after being accepted', async () => {
+    const { id } = await pendingSuggestion()
+    expect((await decide(id, 'accept')).status).toBe(200)
+    const res = await decide(id, 'reject')
+    expect(res.status).toBe(409)
+    expect(serverText()).toBe(ACCEPTED)
+  })
+
+  it('still applies in the right place after people edit around the code', async () => {
+    const { alice, id } = await pendingSuggestion()
+    alice.text.insert(0, '// header\n')
+    alice.text.insert(alice.text.length, '// footer\n')
+    await waitFor(() => serverText()!.endsWith('// footer\n'))
+
+    expect((await decide(id, 'accept')).status).toBe(200)
+    expect(serverText()).toBe(`// header\n${ACCEPTED}// footer\n`)
+  })
+
+  it('refuses, and marks the suggestion stale, when the code under it was edited', async () => {
+    const { alice, bob, id } = await pendingSuggestion()
+    const at = CODE.indexOf('a + b')
+    alice.text.insert(at, '2 * ')
+    const edited = alice.text.toString()
+    await waitFor(() => serverText() === edited)
+
+    const res = await decide(id, 'accept')
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as { error: string }).error).toMatch(/code changed/)
+    await waitFor(() => seen(bob, id)?.status === 'stale')
+    expect(serverText()).toBe(edited)
+    // A stale suggestion can still be dismissed.
+    expect((await decide(id, 'reject')).status).toBe(200)
+  })
+
+  it('answers 404 for a suggestion that does not exist', async () => {
+    await pendingSuggestion()
+    expect((await decide('abcdef123456', 'accept')).status).toBe(404)
+  })
+})
+
+describe('suggestions belong to the server', () => {
+  it('undoes a client changing a suggestion in the shared map', async () => {
+    const llm = new ScriptedLlm().reply('generate', proposal('x = 1'))
+    await start(llm)
+    const alice = await connectWithCode()
+    const bob = await connectWithCode('')
+    const { id } = await askAndSettle(alice, { instruction: 'set x' })
+
+    // Mallory edits shared state directly: a perfect score and different code.
+    const map = alice.doc.getMap<Suggestion>('suggestions')
+    map.set(id, { ...map.get(id)!, score: 1, proposedText: 'stealCookies()' })
+    map.set('fake00000001', { ...map.get(id)!, id: 'fake00000001', instruction: 'trust me' })
+
+    await waitFor(() => seen(bob, id)?.proposedText === 'x = 1' && !bob.doc.getMap('suggestions').has('fake00000001'))
+    await waitFor(() => seen(alice, id)?.proposedText === 'x = 1')
+    expect(seen(alice, id)!.score).toBeNull()
+    expect((await decide('fake00000001', 'accept')).status).toBe(404)
+    expect((await decide(id, 'accept')).status).toBe(200)
+    expect(serverText()).toBe('x = 1')
   })
 })

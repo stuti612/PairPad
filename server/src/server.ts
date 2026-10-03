@@ -4,6 +4,7 @@ import { WebSocket, WebSocketServer } from 'ws'
 import { generateRoomId, isValidRoomId } from './ids.js'
 import { AiError } from './ai/llm.js'
 import type { AiService } from './ai/service.js'
+import { SuggestionError } from './ai/suggestions.js'
 import { Metrics } from './metrics.js'
 import {
   CLOSE_LOAD_FAILED,
@@ -88,6 +89,7 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
     maxDocBytes,
     now,
     onError,
+    onRoomLoaded: ai ? (room) => ai.attach(room) : undefined,
   })
   // ws itself refuses any single frame bigger than a full document could need.
   const wss = new WebSocketServer({
@@ -130,6 +132,10 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
     }
     const aiRoute = AI_ROUTE.exec(pathname)
     if (aiRoute) return handleAi(req, res, aiRoute[1]!)
+    const decision = DECISION_ROUTE.exec(pathname)
+    if (decision) {
+      return handleDecision(req, res, decision[1]!, decision[2]!, decision[3] as 'accept' | 'reject')
+    }
 
     const isPage = req.method === 'GET' || req.method === 'HEAD'
     const reserved = pathname.startsWith('/api/') || pathname.startsWith(WS_PATH_PREFIX)
@@ -175,15 +181,46 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
     // Everyone may leave while the AI works; the room must outlive the request.
     const release = rooms.hold(room)
     try {
-      const proposal = await ai.propose(room, body)
-      sendJson(res, 200, { proposal, quota: ai.quotaFor(roomId) })
+      const suggestion = ai.start(room, body, release)
+      sendJson(res, 202, { id: suggestion.id, quota: ai.quotaFor(roomId) })
     } catch (error) {
+      release()
       const failure =
         error instanceof AiError ? error : new AiError('The AI request failed unexpectedly.', 'unavailable')
       if (!(error instanceof AiError)) onError(error, `AI request in room ${roomId}`)
       sendJson(res, failure.status, { error: failure.message, quota: ai.quotaFor(roomId) })
-    } finally {
-      release()
+    }
+  }
+
+  // Accept or reject a suggestion. Done here on the server, not by clients
+  // editing shared state, so a suggestion is applied exactly once.
+  async function handleDecision(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    roomId: string,
+    suggestionId: string,
+    action: 'accept' | 'reject',
+  ): Promise<void> {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
+    const room = isValidRoomId(roomId) ? rooms.get(roomId) : undefined
+    if (!ai || !room) return sendJson(res, 404, { error: 'That suggestion does not exist.' })
+    let body: Record<string, unknown> = {}
+    try {
+      body = ((await readJson(req, MAX_AI_BODY_BYTES)) ?? {}) as Record<string, unknown>
+    } catch {
+      return sendJson(res, 400, { error: 'The request was not valid JSON.' })
+    }
+    try {
+      const by = typeof body.by === 'string' ? body.by : ''
+      const suggestion =
+        action === 'accept' ? ai.accept(room, suggestionId, by) : ai.reject(room, suggestionId, by)
+      sendJson(res, 200, { status: suggestion.status })
+    } catch (error) {
+      if (error instanceof SuggestionError) {
+        return sendJson(res, error.status, { error: error.message })
+      }
+      onError(error, `${action} in room ${roomId}`)
+      sendJson(res, 500, { error: 'internal error' })
     }
   }
 
@@ -312,6 +349,8 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
         httpServer.close(() => resolve())
         httpServer.closeAllConnections()
       })
+      // Running AI requests end first, so their outcome is saved with the room.
+      await ai?.shutdown()
       // Every room gets its final save before the database connection closes.
       await rooms.closeAll()
       await storage.close()
@@ -320,6 +359,7 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
 }
 
 const AI_ROUTE = /^\/api\/rooms\/([^/]+)\/ai$/
+const DECISION_ROUTE = /^\/api\/rooms\/([^/]+)\/suggestions\/([0-9a-f]{1,32})\/(accept|reject)$/
 const MAX_AI_BODY_BYTES = 16 * 1024
 
 class BodyTooLargeError extends Error {}
