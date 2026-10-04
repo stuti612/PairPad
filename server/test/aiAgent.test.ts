@@ -173,7 +173,8 @@ describe('asking the AI for a change', () => {
     const cursor = state.cursor as { anchor: unknown; head: unknown }
     const at = (relative: unknown) =>
       Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(relative), bob.doc)?.index
-    expect([at(cursor.anchor), at(cursor.head)]).toEqual([9, 12])
+    // "add" was selected; the AI works on (and points at) the whole function.
+    expect([at(cursor.anchor), at(cursor.head)]).toEqual([0, CODE.length - 1])
     // It is not a connection, so it does not take one of the 10 places.
     expect(ts.server.rooms.get(ROOM)?.size).toBe(2)
 

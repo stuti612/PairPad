@@ -338,5 +338,14 @@ function describeSelection(text: Y.Text, { from, to }: Selection): string {
   const content = text.toString()
   const startLine = content.slice(0, from).split('\n').length
   const endLine = content.slice(0, to).split('\n').length
-  return startLine === endLine ? `Selection: line ${startLine}` : `Selection: lines ${startLine} to ${endLine}`
+  if (startLine !== endLine) return `Selection: lines ${startLine} to ${endLine}`
+  // Matches the server (server/src/ai/selection.ts): part of a line is
+  // widened to the statement it belongs to, such as a whole function.
+  const lineStart = content.lastIndexOf('\n', from - 1) + 1
+  const lineEnd = content.indexOf('\n', to)
+  const line = content.slice(lineStart, lineEnd === -1 ? content.length : lineEnd)
+  const partial = line.trim() !== content.slice(from, to).trim()
+  return partial
+    ? `Selection: part of line ${startLine}, widened to the code it belongs to`
+    : `Selection: line ${startLine}`
 }

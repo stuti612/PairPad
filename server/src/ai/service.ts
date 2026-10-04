@@ -7,6 +7,7 @@ import { AiPresence } from './presence.js'
 import { GENERATION_SYSTEM, generationPrompt, SuggestionSchema } from './prompts.js'
 import { AiQuota, type QuotaLimits, type QuotaStatus } from './quota.js'
 import { SuggestionStore, type Suggestion } from './suggestions.js'
+import { widenSelection } from './selection.js'
 import { checkSyntax, type SyntaxResult } from './syntax.js'
 
 // Free tiers allow only a few thousand tokens per minute, so what is sent to
@@ -108,14 +109,18 @@ export class AiService {
       )
     }
     const text = room.doc.getText(TEXT_KEY)
-    const { from, to } = resolveRange(room.doc, text, request.selection)
+    const language = String(room.doc.getMap('meta').get('language') ?? 'javascript')
+    const selected = resolveRange(room.doc, text, request.selection)
+    // With no selection the AI works on the whole pad, exactly as it is.
+    const { from, to } = request.selection
+      ? widenSelection(text.toString(), selected, language, MAX_TARGET_CHARS)
+      : selected
     if (to - from > MAX_TARGET_CHARS) {
       throw new AiError(
         `Select less code: the AI works on up to ${MAX_TARGET_CHARS.toLocaleString('en')} characters at a time.`,
         'invalid',
       )
     }
-    const language = String(room.doc.getMap('meta').get('language') ?? 'javascript')
     // Counted only once the request is known to be valid.
     const refusal = this.quota.take(room.id)
     if (refusal) throw new AiError(refusal, 'limited')
@@ -182,6 +187,8 @@ export class AiService {
 
     try {
       let failures: string[] = []
+      // What the next attempt is told: the failures, plus hints for the model only.
+      let feedback: string[] = []
       let syntax: SyntaxResult | null = null
       let verdict: Verdict | null = null
       for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -194,7 +201,7 @@ export class AiService {
             language,
             instruction,
             ...surroundings(content, from, to),
-            previousFailures: retry ? failures : undefined,
+            previousFailures: retry ? feedback : undefined,
           }),
           schema: SuggestionSchema,
           schemaName: 'suggestion',
@@ -232,6 +239,9 @@ export class AiService {
             failures = [`The automatic check could not be completed: ${error.message}`]
           }
         }
+
+        feedback =
+          syntax.status === 'failed' ? [...failures, fitHint(content, from, to)] : failures
 
         if (failures.length === 0 && verdict) {
           store.update(suggestion.id, {
@@ -283,6 +293,20 @@ export class AiService {
   private now(): number {
     return (this.options.now ?? Date.now)()
   }
+}
+
+/**
+ * The most common reason a replacement does not parse is that it doesn't fit
+ * the gap: it repeats code from just before or after the target region.
+ * Showing the model both edges makes that visible.
+ */
+function fitHint(content: string, from: number, to: number): string {
+  const before = content.slice(Math.max(0, from - 80), from)
+  const after = content.slice(to, to + 80)
+  return (
+    'Your replacement is inserted exactly between these two pieces of the document, ' +
+    `so it must not repeat them. Before it: ${JSON.stringify(before)}. After it: ${JSON.stringify(after)}.`
+  )
 }
 
 function parseRequest(input: unknown): AiRequestInput {

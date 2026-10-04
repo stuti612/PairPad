@@ -5,7 +5,15 @@ import { AiService } from '../src/ai/service.js'
 import type { Suggestion } from '../src/ai/suggestions.js'
 import { checkSyntax } from '../src/ai/syntax.js'
 import { judgement, ScriptedLlm } from './aiHelpers.js'
+import * as Y from 'yjs'
 import { startTestServer, TestClient, waitFor, type TestServer } from './helpers.js'
+
+function selectionOf(client: TestClient, from: number, to: number) {
+  return {
+    anchor: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(client.text, from)),
+    head: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(client.text, to)),
+  }
+}
 
 // The verify-then-show gate, with the model replaced by a scripted double.
 
@@ -24,7 +32,12 @@ afterEach(async () => {
 })
 
 /** Starts a server, opens the pad with CODE (in `language`), asks once, and waits for the outcome. */
-async function askThrough(llm: ScriptedLlm, language = 'javascript', code = CODE): Promise<Suggestion> {
+async function askThrough(
+  llm: ScriptedLlm,
+  language = 'javascript',
+  code = CODE,
+  select?: string,
+): Promise<Suggestion> {
   const ai = new AiService({ llm, quota: { perRoomPerHour: 10, perDay: 100 }, timeoutMs: 5_000 })
   ts = await startTestServer({ ai })
   const client = await new TestClient(ts.wsUrl, ROOM).ready()
@@ -36,7 +49,11 @@ async function askThrough(llm: ScriptedLlm, language = 'javascript', code = CODE
 
   const res = await fetch(`${ts.httpUrl}/api/rooms/${ROOM}/ai`, {
     method: 'POST',
-    body: JSON.stringify({ instruction: 'add input validation', author: 'Alice' }),
+    body: JSON.stringify({
+      instruction: 'add input validation',
+      author: 'Alice',
+      selection: select ? selectionOf(client, code.indexOf(select), code.indexOf(select) + select.length) : null,
+    }),
   })
   expect(res.status).toBe(202)
   const { id } = (await res.json()) as { id: string }
@@ -76,6 +93,16 @@ describe('the verification gate', () => {
     expect(judged.prompt).toContain(`<proposed>\n${VALID}\n</proposed>`)
   })
 
+  it('works on the whole function when only its name is selected', async () => {
+    const pad = `${CODE}\nfunction greet(name) {\n  return "Hi " + name\n}\n`
+    const llm = new ScriptedLlm().reply('generate', write(VALID)).reply('judge', judgement())
+
+    const suggestion = await askThrough(llm, 'javascript', pad, 'add')
+    expect(suggestion.originalText).toBe(CODE.trimEnd())
+    expect(suggestion).toMatchObject({ status: 'pending', proposedText: VALID, attempts: 1 })
+    expect(llm.requests[0]!.prompt).toContain(`<target_region>\n${CODE.trimEnd()}\n</target_region>`)
+  })
+
   it('retries once when the code does not parse, telling the model why, and skips the judge for it', async () => {
     const llm = new ScriptedLlm()
       .reply('generate', write(BROKEN), write(VALID))
@@ -89,6 +116,8 @@ describe('the verification gate', () => {
     const retry = llm.requests.filter((request) => request.role === 'generate')[1]!
     expect(retry.prompt).toContain('A previous attempt at this instruction was turned down')
     expect(retry.prompt).toMatch(/The result doesn't parse: line 2: '\)' expected/)
+    // The model is shown the text on both sides of its replacement...
+    expect(retry.prompt).toContain('Your replacement is inserted exactly between these two pieces')
   })
 
   it('retries once when the judge scores it too low, feeding back the reasons', async () => {
