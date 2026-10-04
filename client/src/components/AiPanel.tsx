@@ -49,7 +49,7 @@ export function AiPanel(props: AiPanelProps) {
       ) : !info.enabled ? (
         <p className="ai-muted">
           The AI collaborator isn't set up on this server. Add a free Groq API key to turn it on;
-          see "AI collaborator: free setup" in the README.
+          see "AI collaborator" in the README.
         </p>
       ) : (
         <>
