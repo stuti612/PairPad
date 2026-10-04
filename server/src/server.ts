@@ -134,7 +134,7 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
     if (aiRoute) return handleAi(req, res, aiRoute[1]!)
     const decision = DECISION_ROUTE.exec(pathname)
     if (decision) {
-      return handleDecision(req, res, decision[1]!, decision[2]!, decision[3] as 'accept' | 'reject')
+      return handleDecision(req, res, decision[1]!, decision[2]!, decision[3] as Decision)
     }
 
     const isPage = req.method === 'GET' || req.method === 'HEAD'
@@ -199,7 +199,7 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
     res: http.ServerResponse,
     roomId: string,
     suggestionId: string,
-    action: 'accept' | 'reject',
+    action: Decision,
   ): Promise<void> {
     if (req.method !== 'POST') return sendJson(res, 405, { error: 'method not allowed' })
     const room = isValidRoomId(roomId) ? rooms.get(roomId) : undefined
@@ -210,8 +210,24 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
     } catch {
       return sendJson(res, 400, { error: 'The request was not valid JSON.' })
     }
+    const by = typeof body.by === 'string' ? body.by : ''
+    if (action === 'rerun') {
+      // A re-run is a new AI request, with the same caps and room hold.
+      const release = rooms.hold(room)
+      try {
+        const fresh = ai.rerun(room, suggestionId, by, release)
+        return sendJson(res, 202, { id: fresh.id, quota: ai.quotaFor(roomId) })
+      } catch (error) {
+        release()
+        if (error instanceof SuggestionError) return sendJson(res, error.status, { error: error.message })
+        if (error instanceof AiError) {
+          return sendJson(res, error.status, { error: error.message, quota: ai.quotaFor(roomId) })
+        }
+        onError(error, `re-run in room ${roomId}`)
+        return sendJson(res, 500, { error: 'internal error' })
+      }
+    }
     try {
-      const by = typeof body.by === 'string' ? body.by : ''
       const suggestion =
         action === 'accept' ? ai.accept(room, suggestionId, by) : ai.reject(room, suggestionId, by)
       sendJson(res, 200, { status: suggestion.status })
@@ -359,7 +375,8 @@ export function createPairPadServer(options: PairPadServerOptions = {}): PairPad
 }
 
 const AI_ROUTE = /^\/api\/rooms\/([^/]+)\/ai$/
-const DECISION_ROUTE = /^\/api\/rooms\/([^/]+)\/suggestions\/([0-9a-f]{1,32})\/(accept|reject)$/
+const DECISION_ROUTE = /^\/api\/rooms\/([^/]+)\/suggestions\/([0-9a-f]{1,32})\/(accept|reject|rerun)$/
+type Decision = 'accept' | 'reject' | 'rerun'
 const MAX_AI_BODY_BYTES = 16 * 1024
 
 class BodyTooLargeError extends Error {}

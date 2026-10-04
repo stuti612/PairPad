@@ -6,7 +6,7 @@ import { AiError, type LlmClient } from './llm.js'
 import { AiPresence } from './presence.js'
 import { GENERATION_SYSTEM, generationPrompt, SuggestionSchema } from './prompts.js'
 import { AiQuota, type QuotaLimits, type QuotaStatus } from './quota.js'
-import { SuggestionStore, type Suggestion } from './suggestions.js'
+import { SuggestionError, SuggestionStore, type Suggestion } from './suggestions.js'
 import { widenSelection } from './selection.js'
 import { checkSyntax, type SyntaxResult } from './syntax.js'
 
@@ -102,25 +102,58 @@ export class AiService {
    */
   start(room: Room, input: unknown, onSettled: () => void = () => {}): Suggestion {
     const request = parseRequest(input)
+    const text = room.doc.getText(TEXT_KEY)
+    const language = String(room.doc.getMap('meta').get('language') ?? 'javascript')
+    const selected = resolveRange(room.doc, text, request.selection)
+    // With no selection the AI works on the whole pad, exactly as it is.
+    const range = request.selection
+      ? widenSelection(text.toString(), selected, language, MAX_TARGET_CHARS)
+      : selected
+    return this.launch(room, request, range, onSettled)
+  }
+
+  /**
+   * Asks again for an out-of-date or failed suggestion: same instruction,
+   * over the code where it is now. The old suggestion is marked as re-run.
+   */
+  rerun(room: Room, id: string, by: string, onSettled: () => void = () => {}): Suggestion {
+    const store = this.attach(room)
+    const old = store.get(id)
+    if (!old) throw new SuggestionError('That suggestion does not exist.', 404)
+    if (old.status !== 'stale' && old.status !== 'failed') {
+      throw new SuggestionError('Only out-of-date or failed suggestions can be re-run.', 409)
+    }
+    const range = store.locate(old)
+    // Yjs keeps the place of deleted text, so deleted code shows up as a
+    // range that has collapsed to nothing, not as a missing one.
+    if (range === null || (old.originalText !== '' && range.from === range.to)) {
+      throw new SuggestionError('The code this suggestion was about has been deleted. Select code and ask again.', 409)
+    }
+    const author = cleanAuthor(by)
+    const fresh = this.launch(room, { instruction: old.instruction, author }, range, onSettled)
+    store.markRerun(id, author, fresh.id)
+    return fresh
+  }
+
+  private launch(
+    room: Room,
+    request: { instruction: string; author: string },
+    { from, to }: { from: number; to: number },
+    onSettled: () => void,
+  ): Suggestion {
     if (this.busyRooms.has(room.id)) {
       throw new AiError(
         'PairPad AI is already working on a request in this pad. Wait for it to finish.',
         'limited',
       )
     }
-    const text = room.doc.getText(TEXT_KEY)
-    const language = String(room.doc.getMap('meta').get('language') ?? 'javascript')
-    const selected = resolveRange(room.doc, text, request.selection)
-    // With no selection the AI works on the whole pad, exactly as it is.
-    const { from, to } = request.selection
-      ? widenSelection(text.toString(), selected, language, MAX_TARGET_CHARS)
-      : selected
     if (to - from > MAX_TARGET_CHARS) {
       throw new AiError(
         `Select less code: the AI works on up to ${MAX_TARGET_CHARS.toLocaleString('en')} characters at a time.`,
         'invalid',
       )
     }
+    const language = String(room.doc.getMap('meta').get('language') ?? 'javascript')
     // Counted only once the request is known to be valid.
     const refusal = this.quota.take(room.id)
     if (refusal) throw new AiError(refusal, 'limited')
@@ -273,7 +306,7 @@ export class AiService {
       const message = this.shuttingDown
         ? 'The server restarted while the AI was working. Ask again.'
         : abort.signal.aborted
-          ? 'The AI took too long and the request was stopped. Try again.'
+          ? `The AI took longer than ${Math.round(this.options.timeoutMs / 1000)} seconds, so the request was stopped. Try again, perhaps on less code.`
           : error instanceof AiError
             ? error.message
             : 'The AI request failed unexpectedly.'

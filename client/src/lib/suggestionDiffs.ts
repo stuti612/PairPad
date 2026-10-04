@@ -11,6 +11,7 @@ import { diffLines, splitLines } from './lineDiff'
 export interface DiffHandlers {
   accept: (id: string) => void
   reject: (id: string) => void
+  rerun: (id: string) => void
 }
 
 interface Item {
@@ -202,6 +203,7 @@ class HeaderWidget extends WidgetType {
       return element
     }
     if (current) bar.append(button('Accept', 'cm-ai-accept', () => handlers.accept(suggestion.id)))
+    else bar.append(button('Re-run', 'cm-ai-rerun', () => handlers.rerun(suggestion.id)))
     bar.append(
       button(current ? 'Reject' : 'Dismiss', 'cm-ai-reject', () => handlers.reject(suggestion.id)),
     )
@@ -242,7 +244,9 @@ const theme = EditorView.baseTheme({
     backgroundColor: 'rgba(52, 211, 153, 0.14)',
     borderLeft: '3px solid rgba(52, 211, 153, 0.8)',
     color: '#d1fae5',
-    whiteSpace: 'pre',
+    // Wraps like the code around it.
+    whiteSpace: 'pre-wrap',
+    overflowWrap: 'anywhere',
     fontFamily: 'inherit',
   },
   '.cm-ai-added-line::before': { content: '"+ "', color: 'rgba(52, 211, 153, 0.9)' },

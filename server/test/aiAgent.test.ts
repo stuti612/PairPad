@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import * as Y from 'yjs'
-import { AiError, BUSY_MESSAGE } from '../src/ai/llm.js'
+import { AiError, BUSY_MESSAGE, type StructuredRequest } from '../src/ai/llm.js'
 import { AI_COLOR, AI_NAME } from '../src/ai/presence.js'
 import { AiService } from '../src/ai/service.js'
 import type { Suggestion } from '../src/ai/suggestions.js'
@@ -377,12 +377,14 @@ describe('accepting and rejecting', () => {
     expect(serverText()).toBe(`// header\n${ACCEPTED}// footer\n`)
   })
 
-  it('refuses, and marks the suggestion stale, when the code under it was edited', async () => {
+  it('marks the suggestion stale as soon as the code under it is edited, and refuses Accept', async () => {
     const { alice, bob, id } = await pendingSuggestion()
     const at = CODE.indexOf('a + b')
     alice.text.insert(at, '2 * ')
     const edited = alice.text.toString()
     await waitFor(() => serverText() === edited)
+    // Everyone sees it go out of date straight away, before anyone clicks.
+    await waitFor(() => seen(bob, id)?.status === 'stale' && seen(alice, id)?.status === 'stale')
 
     const res = await decide(id, 'accept')
     expect(res.status).toBe(409)
@@ -421,3 +423,125 @@ describe('suggestions belong to the server', () => {
     expect(serverText()).toBe('x = 1')
   })
 })
+
+describe('stale suggestions and re-running', () => {
+  const NEW_BODY = '  return Number(a) + Number(b)'
+
+  async function pendingOnLine2(llm: ScriptedLlm) {
+    await start(llm)
+    const alice = await connectWithCode()
+    const bob = await connectWithCode('')
+    const lineStart = CODE.indexOf('  return')
+    const lineEnd = CODE.indexOf('\n', lineStart)
+    const suggestion = await askAndSettle(alice, {
+      instruction: 'coerce to numbers',
+      selection: selectionOf(alice, lineStart, lineEnd),
+    })
+    return { alice, bob, id: suggestion.id }
+  }
+
+  it('goes back to pending when the edit is undone', async () => {
+    const { alice, bob, id } = await pendingOnLine2(new ScriptedLlm().reply('generate', proposal(NEW_BODY)))
+    const at = CODE.indexOf('a + b')
+    alice.text.insert(at, 'X')
+    await waitFor(() => seen(bob, id)?.status === 'stale')
+    alice.text.delete(at, 1)
+    await waitFor(() => seen(bob, id)?.status === 'pending')
+    expect((await decide(id, 'accept')).status).toBe(200)
+  })
+
+  it('is not affected by edits elsewhere in the pad', async () => {
+    const { alice, bob, id } = await pendingOnLine2(new ScriptedLlm().reply('generate', proposal(NEW_BODY)))
+    alice.text.insert(0, '// a comment\n')
+    alice.text.insert(alice.text.length, 'const later = 1\n')
+    await waitFor(() => serverText()!.endsWith('const later = 1\n'))
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(seen(bob, id)!.status).toBe('pending')
+  })
+
+  it('accepting one suggestion makes an overlapping one stale', async () => {
+    const llm = new ScriptedLlm().reply('generate', proposal(NEW_BODY), proposal('function add(x, y) {\n  return x + y\n}'))
+    await start(llm)
+    const alice = await connectWithCode()
+    const lineStart = CODE.indexOf('  return')
+    const first = await askAndSettle(alice, {
+      instruction: 'coerce',
+      selection: selectionOf(alice, lineStart, CODE.indexOf('\n', lineStart)),
+    })
+    const second = await askAndSettle(alice, { instruction: 'rename params' })
+    expect((await decide(first.id, 'accept')).status).toBe(200)
+    await waitFor(() => seen(alice, second.id)?.status === 'stale')
+  })
+
+  it('re-runs a stale suggestion on the code as it is now', async () => {
+    const llm = new ScriptedLlm().reply('generate', proposal(NEW_BODY), proposal('  return Number(a) * 2 + Number(b)'))
+    const { alice, bob, id } = await pendingOnLine2(llm)
+    alice.text.insert(CODE.indexOf('a + b'), '2 * ')
+    await waitFor(() => seen(bob, id)?.status === 'stale')
+
+    const res = await fetch(`${ts.httpUrl}/api/rooms/${ROOM}/suggestions/${id}/rerun`, {
+      method: 'POST',
+      body: JSON.stringify({ by: 'Bob' }),
+    })
+    expect(res.status).toBe(202)
+    const { id: freshId, quota } = (await res.json()) as { id: string; quota: any }
+    expect(quota.room.remaining).toBe(8)
+    await waitFor(() => seen(bob, freshId)?.status === 'pending')
+
+    expect(seen(bob, id)).toMatchObject({ status: 'rejected', resolvedBy: 'Bob', replacedBy: freshId })
+    expect(seen(bob, freshId)).toMatchObject({
+      instruction: 'coerce to numbers',
+      author: 'Bob',
+      originalText: '  return 2 * a + b',
+    })
+    // The new request was given the edited code.
+    expect(llm.requests.filter((request) => request.role === 'generate')[1]!.prompt).toContain('return 2 * a + b')
+    expect((await decide(freshId, 'accept')).status).toBe(200)
+    expect(serverText()).toBe(CODE.replace('  return a + b', '  return Number(a) * 2 + Number(b)'))
+  })
+
+  it('re-runs a failed request, and refuses to re-run one that is still open', async () => {
+    const llm = new ScriptedLlm().reply('generate', new AiError(BUSY_MESSAGE, 'busy'), proposal(NEW_BODY))
+    const { id } = await pendingOnLine2(llm)
+    const rerun = (target: string) =>
+      fetch(`${ts.httpUrl}/api/rooms/${ROOM}/suggestions/${target}/rerun`, { method: 'POST', body: '{}' })
+
+    const res = await rerun(id)
+    expect(res.status).toBe(202)
+    const { id: freshId } = (await res.json()) as { id: string }
+    await ai.idle()
+    expect(seen(clients[0]!, freshId)?.status).toBe('pending')
+    expect((await rerun(freshId)).status).toBe(409)
+  })
+
+  it('cannot re-run a suggestion whose code was deleted', async () => {
+    const { alice, bob, id } = await pendingOnLine2(new ScriptedLlm().reply('generate', proposal(NEW_BODY)))
+    alice.text.delete(0, alice.text.length)
+    await waitFor(() => seen(bob, id)?.status === 'stale')
+    const res = await fetch(`${ts.httpUrl}/api/rooms/${ROOM}/suggestions/${id}/rerun`, { method: 'POST', body: '{}' })
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as { error: string }).error).toMatch(/deleted/)
+  })
+})
+
+describe('request timeout', () => {
+  it('stops a request that takes too long, with a clear message, and frees the pad', async () => {
+    const llm = new ScriptedLlm().reply('generate', (request: StructuredRequest<unknown>) =>
+      new Promise((_resolve, reject) => {
+        request.signal?.addEventListener('abort', () => reject(new AiError('aborted', 'cancelled')))
+      }),
+    )
+    ai = new AiService({ llm, quota: { perRoomPerHour: 10, perDay: 100 }, timeoutMs: 1_000 })
+    llm.replyByDefault('judge', judgement())
+    ts = await startTestServer({ ai })
+    const alice = await connectWithCode()
+
+    const started = Date.now()
+    const suggestion = await askAndSettle(alice, { instruction: 'something slow' })
+    expect(Date.now() - started).toBeLessThan(3_000)
+    expect(suggestion).toMatchObject({ status: 'failed' })
+    expect(suggestion.failureReasons[0]).toMatch(/took longer than 1 seconds, so the request was stopped/)
+    expect(ai.isBusy(ROOM)).toBe(false)
+  })
+})
+

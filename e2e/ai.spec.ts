@@ -139,12 +139,20 @@ test('a suggestion goes out of date when its code is edited, and cannot be accep
     await expect(page.locator('.cm-ai-header').getByRole('button', { name: 'Accept' })).toHaveCount(0)
   }
 
-  // Accepting from the card is refused by the server, and everyone sees why.
-  await card(bob, 'add input validation').getByRole('button', { name: 'Accept' }).click()
-  await expect(card(bob, 'add input validation')).toContainText('code changed')
-  await expect(card(alice, 'add input validation')).toHaveAttribute('data-status', 'stale')
+  // The server marks it out of date for everyone straight away.
+  for (const page of [alice, bob]) {
+    await expect(card(page, 'add input validation')).toHaveAttribute('data-status', 'stale')
+    await expect(card(page, 'add input validation').getByRole('button', { name: 'Accept' })).toHaveCount(0)
+  }
   expect(await padText(bob)).toBe(CODE.replace('a + b', 'a + b // edited'))
   await snap(bob, 'ai-stale')
+
+  // Re-run asks again on the code as it is now.
+  await card(bob, 'add input validation').getByRole('button', { name: 'Re-run' }).click()
+  await expect(panel(alice).locator('[data-status="pending"]')).toHaveCount(1)
+  await expect(alice.locator('.cm-ai-added-line')).toHaveText(['// PairPad AI: add input validation'])
+  await expect(panel(alice).locator('.ai-card').filter({ hasText: 'Re-run by' })).toHaveCount(1)
+  await expect(panel(alice)).toContainText('8 of 10 left this hour')
 })
 
 test("the checks' score and reasons are shown with the suggestion", async ({ browser }) => {

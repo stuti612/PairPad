@@ -71,6 +71,7 @@ export const Editor = memo(
       const diffs = suggestionDiffs(text, {
         accept: (id) => latest.current.diffHandlers.accept(id),
         reject: (id) => latest.current.diffHandlers.reject(id),
+        rerun: (id) => latest.current.diffHandlers.rerun(id),
       })
       const editor = new EditorView({
         parent: host.current!,
@@ -90,6 +91,9 @@ export const Editor = memo(
             highlightActiveLine(),
             highlightSelectionMatches(),
             placeholder('Start typing. Anyone with the link sees it live.'),
+            // Long lines wrap instead of running off the edge (the AI panel
+            // narrows the editor).
+            EditorView.lineWrapping,
             // Undo comes from Yjs (yUndoManagerKeymap) rather than CodeMirror's
             // own history, so Ctrl+Z only undoes your edits, never a collaborator's.
             keymap.of([

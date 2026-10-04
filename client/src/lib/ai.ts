@@ -30,6 +30,7 @@ export interface Suggestion {
   createdAt: number
   updatedAt: number
   resolvedBy: string | null
+  replacedBy: string | null
 }
 
 export interface Quota {
@@ -89,3 +90,17 @@ export async function decideSuggestion(
     throw new Error(body.error ?? `Could not ${action} the suggestion.`)
   }
 }
+
+/** Asks again for an out-of-date or failed suggestion. Counts as a new request. */
+export async function rerunSuggestion(roomId: string, id: string, by: string): Promise<void> {
+  const res = await fetch(`/api/rooms/${roomId}/suggestions/${id}/rerun`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ by }),
+  })
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: string; quota?: Quota }
+    throw new AiRequestError(body.error ?? 'Could not re-run the suggestion.', body.quota)
+  }
+}
+

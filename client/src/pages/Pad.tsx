@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AiPanel, type Selection } from '../components/AiPanel'
 import { Editor, type EditorHandle } from '../components/Editor'
 import { TopBar } from '../components/TopBar'
-import { decideSuggestion } from '../lib/ai'
+import { decideSuggestion, rerunSuggestion } from '../lib/ai'
 import { useAiInfo, useSuggestions } from '../lib/useSuggestions'
 import { useConnection, type Blocked } from '../lib/useConnection'
 import { usePad, useSharedLanguage, type PadSession } from '../lib/usePad'
@@ -51,8 +51,14 @@ function PadView({ roomId, session }: { roomId: string; session: PadSession }) {
     return {
       accept: (id: string) => decide(id, 'accept'),
       reject: (id: string) => decide(id, 'reject'),
+      rerun: (id: string) => {
+        setDecisionError(null)
+        rerunSuggestion(roomId, id, me)
+          .catch((error: Error) => setDecisionError(error.message))
+          .finally(refreshAi)
+      },
     }
-  }, [roomId, me])
+  }, [roomId, me, refreshAi])
 
   useEffect(() => {
     if (!decisionError) return

@@ -4,6 +4,7 @@ import {
   AiRequestError,
   askAi,
   decideSuggestion,
+  rerunSuggestion,
   type AiInfo,
   type Quota,
   type Suggestion,
@@ -184,22 +185,27 @@ function SuggestionCard({
   author,
   connected,
   onFocusSuggestion,
+  onInfoChange,
+  suggestions,
 }: AiPanelProps & { suggestion: Suggestion }) {
   const [error, setError] = useState<string | null>(null)
   const [deciding, setDeciding] = useState(false)
   const { status } = suggestion
 
-  async function decide(action: 'accept' | 'reject') {
+  async function decide(action: 'accept' | 'reject' | 'rerun') {
     setDeciding(true)
     setError(null)
     try {
-      await decideSuggestion(roomId, suggestion.id, action, author)
+      if (action === 'rerun') await rerunSuggestion(roomId, suggestion.id, author)
+      else await decideSuggestion(roomId, suggestion.id, action, author)
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : 'Something went wrong.')
     } finally {
       setDeciding(false)
+      if (action === 'rerun') onInfoChange()
     }
   }
+  const aiBusy = suggestions.some((other) => other.status === 'working')
 
   const canFocus = status === 'pending' || status === 'stale'
   return (
@@ -246,14 +252,18 @@ function SuggestionCard({
         </div>
       )}
       {status === 'stale' && (
-        <p className="ai-card-note">The code changed after the AI read it, so this no longer fits.</p>
+        <p className="ai-card-note">
+          The code changed after the AI read it, so this no longer fits. Re-run it on the current code, or
+          dismiss it.
+        </p>
       )}
       {(status === 'accepted' || status === 'rejected') && suggestion.resolvedBy && (
         <p className="ai-card-note">
-          {status === 'accepted' ? 'Accepted' : 'Rejected'} by {suggestion.resolvedBy}
+          {status === 'accepted' ? 'Accepted' : suggestion.replacedBy ? 'Re-run' : 'Rejected'} by{' '}
+          {suggestion.resolvedBy}
         </p>
       )}
-      {(status === 'pending' || status === 'stale') && (
+      {(status === 'pending' || status === 'stale' || status === 'failed') && (
         <div className="ai-card-actions">
           {status === 'pending' && (
             <button
@@ -265,14 +275,27 @@ function SuggestionCard({
               Accept
             </button>
           )}
-          <button
-            className="button"
-            type="button"
-            disabled={!connected || deciding}
-            onClick={() => decide('reject')}
-          >
-            {status === 'pending' ? 'Reject' : 'Dismiss'}
-          </button>
+          {(status === 'stale' || status === 'failed') && (
+            <button
+              className="button"
+              type="button"
+              disabled={!connected || deciding || aiBusy}
+              title={aiBusy ? 'PairPad AI is working on another request.' : 'Ask again, on the code as it is now'}
+              onClick={() => decide('rerun')}
+            >
+              Re-run
+            </button>
+          )}
+          {status !== 'failed' && (
+            <button
+              className="button"
+              type="button"
+              disabled={!connected || deciding}
+              onClick={() => decide('reject')}
+            >
+              {status === 'pending' ? 'Reject' : 'Dismiss'}
+            </button>
+          )}
         </div>
       )}
       {/* A refused Accept on outdated code is already explained by the stale note. */}

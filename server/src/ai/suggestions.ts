@@ -48,7 +48,12 @@ export interface Suggestion {
   createdAt: number
   updatedAt: number
   resolvedBy: string | null
+  /** The suggestion that replaced this one, when it was re-run. */
+  replacedBy: string | null
 }
+
+const STALE_MESSAGE =
+  'The code changed after the AI read it, so the suggestion no longer fits. Re-run it or dismiss it.'
 
 export class SuggestionError extends Error {
   constructor(
@@ -92,6 +97,8 @@ export class SuggestionStore {
       }
     }
     this.map.observe(this.restoreTampered)
+    this.text.observe(this.checkFreshness)
+    this.checkFreshness()
   }
 
   get(id: string): Suggestion | undefined {
@@ -130,6 +137,7 @@ export class SuggestionStore {
       createdAt: now,
       updatedAt: now,
       resolvedBy: null,
+      replacedBy: null,
     }
     this.write(suggestion)
     return suggestion
@@ -153,9 +161,14 @@ export class SuggestionStore {
   }
 
   /** True when the code under the suggestion is still what the AI saw. */
-  isCurrent(suggestion: Suggestion): boolean {
+  isCurrent(suggestion: Suggestion, content = this.text.toString()): boolean {
     const range = this.locate(suggestion)
-    return range !== null && this.text.toString().slice(range.from, range.to) === suggestion.originalText
+    return range !== null && content.slice(range.from, range.to) === suggestion.originalText
+  }
+
+  /** Records that a suggestion was asked again; `replacement` is the new one. */
+  markRerun(id: string, by: string, replacement: string): void {
+    this.update(id, { status: 'rejected', resolvedBy: by, replacedBy: replacement, updatedAt: this.now() })
   }
 
   /**
@@ -169,10 +182,7 @@ export class SuggestionStore {
     const range = this.locate(suggestion)
     if (range === null || !this.isCurrent(suggestion)) {
       this.update(id, { status: 'stale', updatedAt: this.now() })
-      throw new SuggestionError(
-        'The code changed after the AI read it, so the suggestion no longer fits. Ask again.',
-        409,
-      )
+      throw new SuggestionError(STALE_MESSAGE, 409)
     }
     let accepted!: Suggestion
     this.doc.transact(() => {
@@ -195,11 +205,34 @@ export class SuggestionStore {
 
   destroy(): void {
     this.map.unobserve(this.restoreTampered)
+    this.text.unobserve(this.checkFreshness)
+  }
+
+  /**
+   * After every change to the pad's text: a pending suggestion whose code
+   * was edited becomes stale for everyone, and a stale one whose code is
+   * back to what the AI saw (say, after an undo) is pending again.
+   */
+  private checkFreshness = (): void => {
+    const open = [...this.truth.values()].filter(
+      (suggestion) => suggestion.status === 'pending' || suggestion.status === 'stale',
+    )
+    if (open.length === 0) return
+    const content = this.text.toString()
+    for (const suggestion of open) {
+      const current = this.isCurrent(suggestion, content)
+      if (suggestion.status === 'pending' && !current) {
+        this.update(suggestion.id, { status: 'stale', updatedAt: this.now() })
+      } else if (suggestion.status === 'stale' && current) {
+        this.update(suggestion.id, { status: 'pending', updatedAt: this.now() })
+      }
+    }
   }
 
   private pendingOrThrow(id: string): Suggestion {
     const suggestion = this.truth.get(id)
     if (!suggestion) throw new SuggestionError('That suggestion does not exist.', 404)
+    if (suggestion.status === 'stale') throw new SuggestionError(STALE_MESSAGE, 409)
     if (suggestion.status !== 'pending') {
       throw new SuggestionError(`This suggestion was already ${describe(suggestion.status)}.`, 409)
     }
