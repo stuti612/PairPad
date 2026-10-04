@@ -259,7 +259,7 @@ All settings are environment variables, and all are optional for local developme
 | `DATABASE_URL` | not set | Postgres connection string. When set, Postgres is used. |
 | `SQLITE_PATH` | `server/data/pairpad.sqlite` | SQLite file, used when `DATABASE_URL` is not set. `:memory:` for a throwaway database. |
 | `GROQ_API_KEY`, `GITHUB_TOKEN`, ... | not set | AI provider keys and settings. See "AI collaborator" and `.env.example`. |
-| `REQUIRE_POSTGRES` | not set | Set to `1` to refuse to start without `DATABASE_URL`. Automatic on Replit deployments. |
+| `REQUIRE_POSTGRES` | not set | Set to `1` to refuse to start without `DATABASE_URL` (set in `render.yaml`; automatic on Replit deployments). |
 | `STATIC_DIR` | `client/dist` | Built frontend to serve. |
 | `MAX_USERS_PER_ROOM` | `10` | People allowed in one pad at a time. |
 | `MAX_DOC_BYTES` | `1048576` | Largest stored document, in bytes. |
@@ -325,26 +325,32 @@ The app is one long-running Node process and needs:
 
 Build with `npm ci --include=dev && npm run build` and start with `npm start`.
 
-### Deploying on Replit
+### Deploying for free: Render + Neon
 
-The repository includes a `.replit` file with the build and run commands and the deployment type.
+Both have free plans that need no credit card. The app runs on [Render](https://render.com) and the database on [Neon](https://neon.com). The repository includes `render.yaml`, which sets up the service.
 
-1. In Replit, choose **Import code or design**, then **GitHub**, and select this repository.
-2. Add the database: open the **Database** tool in the workspace and create a PostgreSQL database. This provides `DATABASE_URL`.
-3. Press **Run** once to check it starts. The console should print `Storage: Postgres`.
-4. Open **Deployments** (or **Publish**), choose **Reserved VM**, keep the build and run commands from `.replit`, and deploy. Do not choose Autoscale: it can start several instances and stop them when idle.
-5. Open the deployment's logs and confirm they also say `Storage: Postgres`.
+1. **Database.** Sign up at [neon.com](https://neon.com), create a project, and copy its connection string (Dashboard → **Connect**). It looks like `postgresql://user:password@ep-....neon.tech/neondb?sslmode=require`.
+2. **App.** Sign up at [render.com](https://render.com) with GitHub, choose **New → Blueprint**, and pick this repository. Render reads `render.yaml` and asks for three values:
+   - `DATABASE_URL`: the Neon connection string.
+   - `GROQ_API_KEY`: your Groq key (see "Free setup" above).
+   - `GITHUB_TOKEN`: optional, for the AI fallback. Leave it empty to skip.
+3. **Deploy.** The first build takes a few minutes. The logs should end with `Storage: Postgres` and an `AI:` line, and the app is live at `https://<service-name>.onrender.com`.
 
-A deployment without `DATABASE_URL` refuses to start instead of saving pads to a local file, because a deployment's disk may not survive a restart.
-
-Then check the live app:
+Check it:
 
 ```bash
-curl https://<your-app>.replit.app/health
-npm run loadtest -- --url https://<your-app>.replit.app
+curl https://<service-name>.onrender.com/health
+npm run loadtest -- --url https://<service-name>.onrender.com
 ```
 
-The server listens on port 3001 unless `PORT` is set; `.replit` maps that port to the public one.
+What the free plans mean in practice:
+
+- **The app sleeps** after 15 minutes without visitors, and the next visit waits about a minute while it wakes. Pads are saved before it sleeps, so nothing is lost.
+- **AI caps reset** whenever the app restarts or wakes, because they are counted in memory. Groq's own free limits still apply behind them.
+- **Neon** pauses the database when idle and resumes it on the next query, which adds a moment to the first pad opened after a quiet spell.
+- A deployment without `DATABASE_URL` refuses to start instead of saving pads to a local file, because the instance's disk is wiped on every restart.
+
+The server listens on the port in `PORT`, which Render sets. The repository also contains a `.replit` file for Replit, but deploying there needs a paid Reserved VM.
 
 ## Known limitations
 

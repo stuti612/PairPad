@@ -1,0 +1,24 @@
+# Render Blueprint: one free web service. The database is Neon's free
+# Postgres (render.com free databases expire, Neon's do not), so DATABASE_URL
+# is pasted in from Neon. See "Deploying for free" in the README.
+services:
+  - type: web
+    name: pairpad
+    runtime: node
+    plan: free
+    # Dev dependencies are needed to build (TypeScript, Vite).
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      # Refuse to start without a database rather than save pads to the
+      # instance's disk, which is wiped on every restart.
+      - key: REQUIRE_POSTGRES
+        value: "1"
+      # Secrets: Render asks for these when the Blueprint is created.
+      - key: DATABASE_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
