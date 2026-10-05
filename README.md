@@ -2,6 +2,8 @@
 
 A real-time collaborative code scratchpad. Create a pad, share the link, and two to ten people can type in the same document at once, with no sign-up.
 
+**Live demo: [pairpad.onrender.com](https://pairpad.onrender.com)** (free hosting: if nobody has used it for 15 minutes, the first visit takes about a minute to wake it up).
+
 - **Live editing** with syntax highlighting for JavaScript, TypeScript, Python and plain text. The language choice is shared by everyone in the pad.
 - **Presence**: each person has a name and color, a live cursor and selection, and appears in a "who's here" list.
 - **Works through disconnects**: you keep typing while offline and your edits merge when you reconnect.
@@ -244,6 +246,23 @@ Latency, from an edit to another client applying it:
   max   9.3 ms
 
 Server /metrics    1099.3 messages/s over the last 10 s, 16959 in total
+```
+
+The same test against the deployed app on Render's free plan (shared CPU, 512 MB), over the internet, so these latencies include the network both ways:
+
+```
+Clients            50 across 5 rooms
+Deliveries         13491 of 13491
+Disconnects        0
+Rooms converged    yes
+
+Latency, from an edit to another client applying it:
+  min   33.7 ms
+  mean  63.1 ms
+  p50   40.9 ms
+  p95   217.9 ms
+  p99   336.0 ms
+  max   490.2 ms
 ```
 
 The server's message count is higher than the edit rate because it counts every incoming frame: each keystroke sends a document update and a cursor update, and the stock `y-websocket` client also echoes presence updates it receives back to the server, which ignores them.
